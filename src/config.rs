@@ -316,3 +316,134 @@ fn default_worker_count() -> usize {
         .unwrap_or(1)
         .clamp(1, 4)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn parses_supported_model_variant_aliases() {
+        let cases = [
+            ("fp32", "fp32"),
+            ("float-16", "fp16"),
+            ("UINT_8", "uint8"),
+            ("quant", "quantized"),
+            ("q4_fp16", "q4f16"),
+            ("bitsandbytes4", "bnb4"),
+            ("custom", "custom"),
+        ];
+
+        for (raw, expected) in cases {
+            let variant = parse_model_variant_value(raw).unwrap();
+            assert_eq!(variant.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_model_variant() {
+        let err = parse_model_variant_value("fp12").unwrap_err();
+
+        assert!(err.to_string().contains("unsupported model variant `fp12`"));
+    }
+
+    #[test]
+    fn model_variant_selects_matching_default_model_path() {
+        let cases = [
+            (
+                ModelVariant::Fp32,
+                "Florence-2-base/onnx/vision_encoder.onnx",
+            ),
+            (
+                ModelVariant::Fp16,
+                "Florence-2-base/onnx/vision_encoder_fp16.onnx",
+            ),
+            (
+                ModelVariant::Q4F16,
+                "Florence-2-base/onnx/vision_encoder_q4f16.onnx",
+            ),
+        ];
+
+        for (variant, expected) in cases {
+            assert_eq!(variant.default_model_path(), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn explicit_missing_config_path_is_an_error() {
+        let path = unique_temp_path("missing-config.toml");
+        let err = FileConfig::load(Some(path.clone())).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("config file does not exist: {}", path.display()))
+        );
+    }
+
+    #[test]
+    fn loads_file_config_from_toml() {
+        let path = unique_temp_path("config.toml");
+        fs::write(
+            &path,
+            r#"
+[server]
+bind_addr = "127.0.0.1:9999"
+data_dir = "tmp-data"
+
+[model]
+variant = "q4-f16"
+
+[queue]
+model_pool_size = 2
+queue_size = 8
+body_limit_bytes = 4096
+
+[generation]
+max_new_tokens = 32
+
+[runtime]
+execution_providers = ["coreml-gpu", "xnnpack"]
+
+[logging]
+rust_log = "debug"
+"#,
+        )
+        .unwrap();
+
+        let config = FileConfig::load(Some(path.clone())).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let server = config.server.unwrap();
+        let model = config.model.unwrap();
+        let queue = config.queue.unwrap();
+        let generation = config.generation.unwrap();
+        let runtime = config.runtime.unwrap();
+        let logging = config.logging.unwrap();
+
+        assert_eq!(server.bind_addr.as_deref(), Some("127.0.0.1:9999"));
+        assert_eq!(server.data_dir, Some(PathBuf::from("tmp-data")));
+        assert_eq!(model.variant.as_deref(), Some("q4-f16"));
+        assert_eq!(queue.model_pool_size, Some(2));
+        assert_eq!(queue.queue_size, Some(8));
+        assert_eq!(queue.body_limit_bytes, Some(4096));
+        assert_eq!(generation.max_new_tokens, Some(32));
+        assert_eq!(
+            runtime.execution_providers,
+            Some(vec!["coreml-gpu".to_string(), "xnnpack".to_string()])
+        );
+        assert_eq!(logging.rust_log.as_deref(), Some("debug"));
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        env::temp_dir().join(format!("florence2-base-inference-server-{nanos}-{name}"))
+    }
+}

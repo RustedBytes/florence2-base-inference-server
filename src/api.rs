@@ -386,3 +386,74 @@ fn render_index(
         ApiError::Internal(anyhow::anyhow!("failed to render index template: {err}"))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{TaskPrompt, TaskType};
+
+    #[test]
+    fn request_task_defaults_to_single_caption() {
+        let task = task_spec_from_request(None, None, None, None).unwrap();
+
+        assert_eq!(task.task_type, TaskType::Single);
+        assert_eq!(task.task_prompt, TaskPrompt::Caption);
+        assert_eq!(task.text_input, None);
+    }
+
+    #[test]
+    fn request_task_prefers_task_prompt_over_alias() {
+        let task = task_spec_from_request(
+            Some("Single task".to_string()),
+            Some("OCR".to_string()),
+            Some("  text to trim  ".to_string()),
+            Some("Caption".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(task.task_prompt, TaskPrompt::Ocr);
+        assert_eq!(task.text_input.as_deref(), Some("text to trim"));
+    }
+
+    #[test]
+    fn request_task_uses_task_alias_when_prompt_is_absent() {
+        let task = task_spec_from_request(
+            Some("Single task".to_string()),
+            None,
+            None,
+            Some("OCR with Region".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(task.task_prompt, TaskPrompt::OcrWithRegion);
+    }
+
+    #[test]
+    fn request_task_rejects_invalid_prompt_for_task_type() {
+        let err = task_spec_from_request(
+            Some("Single task".to_string()),
+            Some("Caption + Grounding".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(
+            err.to_string()
+                .contains("unsupported task_prompt `Caption + Grounding`")
+        );
+    }
+
+    #[test]
+    fn index_template_contains_task_options_and_error() {
+        let html = render_index(None, Some("bad request".to_string()))
+            .unwrap()
+            .0;
+
+        assert!(html.contains("Florence-2 Inference"));
+        assert!(html.contains("OCR with Region"));
+        assert!(html.contains("Caption + Grounding"));
+        assert!(html.contains("bad request"));
+    }
+}
