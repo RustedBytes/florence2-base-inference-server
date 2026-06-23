@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, anyhow};
 use async_channel::Receiver;
@@ -213,7 +218,121 @@ async fn finish_job(
                 config.results_jsonl.display()
             );
         }
+        cleanup_job_artifacts(config, &record).await;
     } else {
         warn!("job missing while finishing job_id={}", id);
+    }
+}
+
+async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
+    if !should_delete_image(config, record) {
+        return;
+    }
+
+    match tokio::fs::remove_file(&record.image_path).await {
+        Ok(()) => {
+            info!(
+                "uploaded image cleaned up job_id={} path={}",
+                record.id,
+                record.image_path.display()
+            );
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            debug!(
+                "uploaded image already removed job_id={} path={}",
+                record.id,
+                record.image_path.display()
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to clean up uploaded image job_id={} path={} error={}",
+                record.id,
+                record.image_path.display(),
+                err
+            );
+        }
+    }
+}
+
+fn should_delete_image(config: &Config, record: &JobRecord) -> bool {
+    record.input_kind == "upload" && path_is_inside(&record.image_path, &config.images_dir)
+}
+
+fn path_is_inside(path: &Path, directory: &Path) -> bool {
+    path.starts_with(directory) && path != directory
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::config::ModelVariant;
+
+    fn test_config() -> Config {
+        Config {
+            addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            model_path: PathBuf::from("Florence-2-base/onnx/vision_encoder.onnx"),
+            model_variant: ModelVariant::Fp32,
+            data_dir: PathBuf::from("data"),
+            images_dir: PathBuf::from("data/images"),
+            metadata_dir: PathBuf::from("data/metadata"),
+            submissions_jsonl: PathBuf::from("data/metadata/submissions.jsonl"),
+            results_jsonl: PathBuf::from("data/metadata/results.jsonl"),
+            workers: 1,
+            queue_size: 1,
+            body_limit_bytes: 1024,
+            rust_log: "info".to_string(),
+            max_new_tokens: 1,
+            execution_providers: vec!["cpu".to_string()],
+        }
+    }
+
+    fn job_record(input_kind: &str, image_path: PathBuf) -> JobRecord {
+        let now = OffsetDateTime::now_utc();
+
+        JobRecord {
+            id: Uuid::nil(),
+            status: JobStatus::Succeeded,
+            created_at: now,
+            updated_at: now,
+            image_path,
+            filename: None,
+            content_type: None,
+            image_sha256: String::new(),
+            image_bytes: 0,
+            input_kind: input_kind.to_string(),
+            source_path: None,
+            task_type: "Single task".to_string(),
+            task_prompt: "Caption".to_string(),
+            text_input: None,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn deletes_only_uploaded_images_under_images_dir() {
+        let config = test_config();
+
+        assert!(should_delete_image(
+            &config,
+            &job_record("upload", PathBuf::from("data/images/job.png"))
+        ));
+        assert!(!should_delete_image(
+            &config,
+            &job_record("local_path", PathBuf::from("data/images/job.png"))
+        ));
+        assert!(!should_delete_image(
+            &config,
+            &job_record("upload", PathBuf::from("/tmp/source.png"))
+        ));
+        assert!(!should_delete_image(
+            &config,
+            &job_record("upload", PathBuf::from("data/images"))
+        ));
     }
 }
