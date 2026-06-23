@@ -9,7 +9,7 @@ mod util;
 
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use log::{debug, info};
 use state::{AppMetrics, AppState, RateLimiter, WorkerPoolState};
@@ -130,12 +130,12 @@ async fn shutdown_signal() {
 }
 
 fn init_tracing(rust_log: &str) -> anyhow::Result<()> {
-    let _ = tracing_log::LogTracer::init();
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(rust_log))?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
         .compact()
-        .init();
+        .try_init()
+        .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
     Ok(())
 }
