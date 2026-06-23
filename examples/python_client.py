@@ -47,6 +47,7 @@ class FlorenceClient:
         task_type: str,
         task_prompt: str,
         text_input: str | None,
+        webhook_url: str | None,
     ) -> dict[str, Any]:
         content_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
         fields: dict[str, Any] = {
@@ -56,6 +57,8 @@ class FlorenceClient:
         }
         if text_input is not None:
             fields["text_input"] = text_input
+        if webhook_url is not None:
+            fields["webhook_url"] = webhook_url
 
         return self._request_json("POST", "v1/infer", fields=fields)
 
@@ -65,12 +68,14 @@ class FlorenceClient:
         task_type: str,
         task_prompt: str,
         text_input: str | None,
+        webhook_url: str | None,
     ) -> dict[str, Any]:
         payload = {
             "image_path": image_path,
             "task_type": task_type,
             "task_prompt": task_prompt,
             "text_input": text_input,
+            "webhook_url": webhook_url,
         }
         return self._request_json(
             "POST",
@@ -128,6 +133,7 @@ def main() -> int:
     parser.add_argument("--task-type", default="Single task")
     parser.add_argument("--task-prompt", default="Caption")
     parser.add_argument("--text-input")
+    parser.add_argument("--webhook-url", help="optional HTTP(S) URL that receives the final job JSON")
     parser.add_argument("--no-wait", action="store_true", help="print the queued job only")
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--read-timeout", type=float, default=300.0)
@@ -154,6 +160,7 @@ def main() -> int:
                 args.task_type,
                 args.task_prompt,
                 args.text_input,
+                args.webhook_url,
             )
         elif args.command == "path":
             response = client.submit_local_path(
@@ -161,6 +168,7 @@ def main() -> int:
                 args.task_type,
                 args.task_prompt,
                 args.text_input,
+                args.webhook_url,
             )
         else:
             response = client.get_job(args.job_id)

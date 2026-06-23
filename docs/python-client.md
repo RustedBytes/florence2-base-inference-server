@@ -28,6 +28,14 @@ python3 examples/python_client.py \
   upload /path/to/image.png
 ```
 
+Send the final job result to a webhook:
+
+```bash
+python3 examples/python_client.py \
+  --webhook-url https://example.com/florence-webhook \
+  upload /path/to/image.png
+```
+
 Fetch an existing job:
 
 ```bash

@@ -104,6 +104,7 @@ struct LocalPathRequest {
     task_type: Option<String>,
     task_prompt: Option<String>,
     text_input: Option<String>,
+    webhook_url: Option<String>,
     task: Option<String>,
 }
 
@@ -212,6 +213,7 @@ async fn submit_multipart_job(
     let mut task_type: Option<String> = None;
     let mut task_prompt: Option<String> = None;
     let mut text_input: Option<String> = None;
+    let mut webhook_url: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -254,10 +256,16 @@ async fn submit_multipart_job(
                     ApiError::BadRequest(format!("failed to read text_input field: {err}"))
                 })?);
             }
+            "webhook_url" => {
+                webhook_url = Some(field.text().await.map_err(|err| {
+                    ApiError::BadRequest(format!("failed to read webhook_url field: {err}"))
+                })?);
+            }
             _ => {}
         }
     }
     let task = task_spec_from_request(task_type, task_prompt, text_input, None)?;
+    let webhook_url = validate_webhook_url(webhook_url)?;
 
     let image =
         image.ok_or_else(|| ApiError::BadRequest("multipart field `image` is required".into()))?;
@@ -298,6 +306,7 @@ async fn submit_multipart_job(
         task_type: task.task_type_name().to_string(),
         task_prompt: task.task_prompt_name().to_string(),
         text_input: task.text_input,
+        webhook_url,
         result: None,
         error: None,
     };
@@ -362,6 +371,7 @@ async fn submit_inference_path(
         request.text_input,
         request.task,
     )?;
+    let webhook_url = validate_webhook_url(request.webhook_url)?;
     let filename = image_path
         .file_name()
         .map(|filename| filename.to_string_lossy().into_owned());
@@ -390,6 +400,7 @@ async fn submit_inference_path(
         task_type: task.task_type_name().to_string(),
         task_prompt: task.task_prompt_name().to_string(),
         text_input: task.text_input,
+        webhook_url,
         result: None,
         error: None,
     };
@@ -458,6 +469,29 @@ fn task_spec_from_request(
 ) -> Result<TaskSpec, ApiError> {
     TaskSpec::from_strings(task_type, task_prompt.or(task_alias), text_input)
         .map_err(|err| ApiError::BadRequest(err.to_string()))
+}
+
+fn validate_webhook_url(webhook_url: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(webhook_url) = webhook_url.map(|value| value.trim().to_string()) else {
+        return Ok(None);
+    };
+    if webhook_url.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = reqwest::Url::parse(&webhook_url)
+        .map_err(|err| ApiError::BadRequest(format!("invalid webhook_url: {err}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::BadRequest(
+            "webhook_url must not include credentials".to_string(),
+        ));
+    }
+    match parsed.scheme() {
+        "http" | "https" => Ok(Some(parsed.to_string())),
+        scheme => Err(ApiError::BadRequest(format!(
+            "unsupported webhook_url scheme `{scheme}`; expected http or https"
+        ))),
+    }
 }
 
 fn render_index(
@@ -688,6 +722,7 @@ fn openapi_document() -> Value {
                         "task_type": { "type": "string" },
                         "task_prompt": { "type": "string" },
                         "text_input": { "type": ["string", "null"] },
+                        "webhook_url": { "type": ["string", "null"], "format": "uri" },
                         "task": { "type": "string", "deprecated": true }
                     }
                 },
@@ -698,7 +733,8 @@ fn openapi_document() -> Value {
                         "image": { "type": "string", "format": "binary" },
                         "task_type": { "type": "string" },
                         "task_prompt": { "type": "string" },
-                        "text_input": { "type": "string" }
+                        "text_input": { "type": "string" },
+                        "webhook_url": { "type": "string", "format": "uri" }
                     }
                 },
                 "WorkerHealth": {
@@ -848,6 +884,31 @@ mod tests {
 
         assert!(matches!(err, ApiError::BadRequest(_)));
         assert!(err.to_string().contains("unsupported content type"));
+    }
+
+    #[test]
+    fn validates_optional_webhook_url() {
+        let url = validate_webhook_url(Some(" http://example.com/hook ".to_string())).unwrap();
+
+        assert_eq!(url.as_deref(), Some("http://example.com/hook"));
+        assert_eq!(validate_webhook_url(Some("  ".to_string())).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_unsupported_webhook_url_scheme() {
+        let err = validate_webhook_url(Some("file:///tmp/hook".to_string())).unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(err.to_string().contains("expected http or https"));
+    }
+
+    #[test]
+    fn rejects_webhook_url_credentials() {
+        let err = validate_webhook_url(Some("https://user:secret@example.com/hook".to_string()))
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(err.to_string().contains("must not include credentials"));
     }
 
     #[tokio::test]

@@ -20,6 +20,8 @@ use crate::{
     util::append_jsonl,
 };
 
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct JobRequest {
     pub id: Uuid,
@@ -479,6 +481,7 @@ async fn finish_job(
                 config.results_jsonl.display()
             );
         }
+        send_webhook(&record).await;
         cleanup_job_artifacts(config, &record).await;
         {
             let mut jobs = jobs.write().await;
@@ -487,6 +490,41 @@ async fn finish_job(
     } else {
         warn!("job missing while finishing job_id={}", id);
     }
+}
+
+async fn send_webhook(record: &JobRecord) {
+    let Some(webhook_url) = record.webhook_url.as_deref() else {
+        return;
+    };
+
+    match post_webhook(webhook_url, record).await {
+        Ok(()) => info!("webhook delivered job_id={} url={}", record.id, webhook_url),
+        Err(err) => warn!(
+            "webhook delivery failed job_id={} url={} error={}",
+            record.id, webhook_url, err
+        ),
+    }
+}
+
+async fn post_webhook(webhook_url: &str, record: &JobRecord) -> anyhow::Result<()> {
+    let response = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .context("failed to build webhook HTTP client")?
+        .post(webhook_url)
+        .json(record)
+        .send()
+        .await
+        .with_context(|| format!("failed to send webhook request to {webhook_url}"))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "webhook endpoint returned HTTP {}",
+            response.status()
+        ));
+    }
+
+    Ok(())
 }
 
 async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
@@ -534,6 +572,7 @@ mod tests {
 
     use async_channel::bounded;
     use time::OffsetDateTime;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
@@ -586,6 +625,7 @@ mod tests {
             task_type: "Single task".to_string(),
             task_prompt: "Caption".to_string(),
             text_input: None,
+            webhook_url: None,
             result: None,
             error: None,
         }
@@ -705,5 +745,98 @@ mod tests {
 
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         drop(queue_rx);
+    }
+
+    #[tokio::test]
+    async fn post_webhook_sends_final_job_record() {
+        let (url, server) = spawn_webhook_receiver().await;
+        let mut record = job_record("upload", PathBuf::from("data/images/job.png"));
+        record.id = Uuid::new_v4();
+        record.webhook_url = Some(url.clone());
+
+        post_webhook(&url, &record).await.unwrap();
+
+        let request = server.await.unwrap();
+        let request = String::from_utf8(request).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(body).unwrap();
+
+        assert!(request.starts_with("POST /hook HTTP/1.1"));
+        assert_eq!(body["id"], record.id.to_string());
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["webhook_url"], url);
+    }
+
+    #[tokio::test]
+    async fn finish_job_delivers_webhook_with_terminal_record() {
+        let config = temp_config("finish-webhook");
+        let (url, server) = spawn_webhook_receiver().await;
+        let mut record = job_record("upload", config.images_dir.join("job.png"));
+        record.id = Uuid::new_v4();
+        record.status = JobStatus::Running;
+        record.webhook_url = Some(url);
+        let id = record.id;
+        let jobs = RwLock::new(HashMap::from([(id, record)]));
+
+        finish_job(&config, &jobs, id, Err(anyhow!("inference failed"))).await;
+
+        let request = server.await.unwrap();
+        let request = String::from_utf8(request).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(body).unwrap();
+
+        assert_eq!(body["id"], id.to_string());
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"], "inference failed");
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+
+    async fn spawn_webhook_receiver() -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0, "client closed before sending full request");
+                request.extend_from_slice(&buffer[..n]);
+
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+
+        (url, server)
+    }
+
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.split_once(':'))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        request.len() >= header_end + content_length
     }
 }

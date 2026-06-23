@@ -153,6 +153,11 @@ use crate::types::TaskPrompt;
         <textarea id="text_input" name="text_input" placeholder="Optional text for grounding, segmentation, region, or open-vocabulary tasks"></textarea>
       </div>
 
+      <div>
+        <label for="webhook_url">Webhook URL (optional)</label>
+        <input id="webhook_url" name="webhook_url" type="url" placeholder="https://example.com/florence-webhook">
+      </div>
+
       <button type="submit">Submit</button>
     </form>
 

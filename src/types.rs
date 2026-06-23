@@ -34,6 +34,7 @@ pub struct JobRecord {
     pub task_type: String,
     pub task_prompt: String,
     pub text_input: Option<String>,
+    pub webhook_url: Option<String>,
     pub result: Option<InferenceMetadata>,
     pub error: Option<String>,
 }
