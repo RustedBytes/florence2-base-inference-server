@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
     config.ensure_dirs().await?;
     debug!(
-        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} max_new_tokens={} rust_log={}",
+        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} max_new_tokens={} execution_providers={:?} rust_log={}",
         config.addr,
         config.model_path.display(),
         config.model_variant.as_str(),
@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         config.queue_size,
         config.body_limit_bytes,
         config.max_new_tokens,
+        config.execution_providers,
         config.rust_log
     );
 
@@ -66,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind TCP listener")?;
 
     info!(
-        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} max_new_tokens={}",
+        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} max_new_tokens={} execution_providers={:?}",
         config.addr,
         config.workers,
         config.model_path.display(),
@@ -74,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
         config.data_dir.display(),
         config.queue_size,
         config.body_limit_bytes,
-        config.max_new_tokens
+        config.max_new_tokens,
+        config.execution_providers
     );
 
     axum::serve(listener, app)

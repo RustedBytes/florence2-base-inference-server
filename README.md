@@ -117,6 +117,9 @@ body_limit_bytes = 33554432
 [generation]
 max_new_tokens = 256
 
+[runtime]
+execution_providers = ["auto"]
+
 [logging]
 rust_log = "info,ort=warn"
 ```
@@ -133,6 +136,17 @@ Supported `model.variant` values:
 - `bnb4`
 - `custom`
 
+Supported `runtime.execution_providers` values:
+
+- `auto`: ORT auto-device policy, with CPU fallback
+- `cpu`: CPU only
+- `coreml`: CoreML with all Apple compute units
+- `coreml_gpu`: CoreML CPU+GPU
+- `coreml_npu`: CoreML CPU+Neural Engine
+- `xnnpack`: XNNPACK when available in the ORT build
+
+`auto` is the default. On Apple Silicon, CoreML may register successfully but still compile only parts of Florence's dynamic ONNX graphs and can emit unbounded-dimension warnings during session load.
+
 Environment variables override TOML values when set:
 
 - `BIND_ADDR`: bind address, default `127.0.0.1:3000`
@@ -143,6 +157,7 @@ Environment variables override TOML values when set:
 - `MODEL_VARIANT`: model variant
 - `MODEL_PATH`: explicit ONNX model path, overrides `MODEL_VARIANT` path selection
 - `MAX_NEW_TOKENS`: maximum decoder tokens per generation
+- `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
 

@@ -13,6 +13,7 @@ const DEFAULT_QUEUE_SIZE: usize = 128;
 const DEFAULT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUST_LOG: &str = "info,ort=warn";
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
+const DEFAULT_EXECUTION_PROVIDER: &str = "auto";
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -28,6 +29,7 @@ pub struct Config {
     pub body_limit_bytes: usize,
     pub rust_log: String,
     pub max_new_tokens: usize,
+    pub execution_providers: Vec<String>,
 }
 
 impl Config {
@@ -37,6 +39,7 @@ impl Config {
         let model = file_config.model.unwrap_or_default();
         let queue = file_config.queue.unwrap_or_default();
         let generation = file_config.generation.unwrap_or_default();
+        let runtime = file_config.runtime.unwrap_or_default();
         let logging = file_config.logging.unwrap_or_default();
 
         let data_dir = path_setting("DATA_DIR", server.data_dir, DEFAULT_DATA_DIR);
@@ -76,6 +79,7 @@ impl Config {
                 DEFAULT_MAX_NEW_TOKENS,
             )?
             .max(1),
+            execution_providers: execution_providers_setting(runtime.execution_providers),
         })
     }
 
@@ -104,6 +108,7 @@ struct FileConfig {
     model: Option<ModelConfig>,
     queue: Option<QueueConfig>,
     generation: Option<GenerationConfig>,
+    runtime: Option<RuntimeConfig>,
     logging: Option<LoggingConfig>,
 }
 
@@ -156,6 +161,11 @@ struct QueueConfig {
 #[derive(Debug, Default, Deserialize)]
 struct GenerationConfig {
     max_new_tokens: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeConfig {
+    execution_providers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -235,6 +245,31 @@ fn usize_setting(key: &str, file_value: Option<usize>, default: usize) -> anyhow
             .parse()
             .map_err(|err| anyhow!("{key} has invalid value `{value}`: {err}")),
         Err(_) => Ok(file_value.unwrap_or(default)),
+    }
+}
+
+fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {
+    let values = env::var("EXECUTION_PROVIDERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .or(file_value)
+        .unwrap_or_else(|| vec![DEFAULT_EXECUTION_PROVIDER.to_string()]);
+
+    let normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase().replace(['-', '_'], ""))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    if normalized.is_empty() {
+        vec![DEFAULT_EXECUTION_PROVIDER.to_string()]
+    } else {
+        normalized
     }
 }
 

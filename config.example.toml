@@ -17,5 +17,10 @@ body_limit_bytes = 33554432
 [generation]
 max_new_tokens = 256
 
+[runtime]
+# Supported values: auto, cpu, coreml, coreml_gpu, coreml_npu, xnnpack.
+# Keep auto as the default. CoreML can be noisy/slow to compile for Florence's dynamic ONNX graphs.
+execution_providers = ["auto"]
+
 [logging]
 rust_log = "info,ort=warn"

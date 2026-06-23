@@ -10,6 +10,7 @@ use image::{DynamicImage, GenericImageView, ImageReader, imageops::FilterType};
 use log::{debug, info, trace, warn};
 use ort::{
     environment::Environment,
+    ep::{self, ExecutionProviderDispatch},
     session::{
         Session,
         builder::{AutoDevicePolicy, GraphOptimizationLevel},
@@ -43,6 +44,7 @@ pub struct FlorenceWorker {
     input_name: String,
     input_dtype: TensorElementType,
     max_new_tokens: usize,
+    execution_providers: Vec<String>,
 }
 
 impl FlorenceWorker {
@@ -83,11 +85,15 @@ impl FlorenceWorker {
         }
 
         let session_started = Instant::now();
-        let vision_encoder = load_session(&model_paths.vision_encoder)?;
-        let embed_tokens = load_session(&model_paths.embed_tokens)?;
-        let encoder_model = load_session(&model_paths.encoder_model)?;
-        let decoder_model = load_session(&model_paths.decoder_model)?;
-        let decoder_with_past_model = load_session(&model_paths.decoder_with_past_model)?;
+        let vision_encoder =
+            load_session(&model_paths.vision_encoder, &config.execution_providers)?;
+        let embed_tokens = load_session(&model_paths.embed_tokens, &config.execution_providers)?;
+        let encoder_model = load_session(&model_paths.encoder_model, &config.execution_providers)?;
+        let decoder_model = load_session(&model_paths.decoder_model, &config.execution_providers)?;
+        let decoder_with_past_model = load_session(
+            &model_paths.decoder_with_past_model,
+            &config.execution_providers,
+        )?;
         let (input_name, input_dtype) = image_input_metadata(&vision_encoder)?;
         debug!(
             "ONNX image input detected worker_id={} input_name={} input_dtype={}",
@@ -121,13 +127,15 @@ impl FlorenceWorker {
             input_name,
             input_dtype,
             max_new_tokens: config.max_new_tokens,
+            execution_providers: config.execution_providers.clone(),
         };
 
         info!(
-            "model worker initialized worker_id={} backend={} max_new_tokens={} elapsed_ms={}",
+            "model worker initialized worker_id={} backend={} max_new_tokens={} execution_providers={:?} elapsed_ms={}",
             id,
             worker.backend,
             worker.max_new_tokens,
+            worker.execution_providers,
             started.elapsed().as_millis()
         );
 
@@ -149,6 +157,7 @@ impl FlorenceWorker {
             input_name: self.input_name.clone(),
             input_dtype: self.input_dtype,
             max_new_tokens: self.max_new_tokens,
+            execution_providers: self.execution_providers.clone(),
         }
     }
 
@@ -602,15 +611,75 @@ impl TensorData {
     }
 }
 
-fn load_session(path: &Path) -> anyhow::Result<Session> {
-    Session::builder()
+fn load_session(path: &Path, execution_providers: &[String]) -> anyhow::Result<Session> {
+    let requested_eps = execution_provider_dispatches(execution_providers);
+    let use_auto_device = execution_providers
+        .iter()
+        .any(|provider| matches!(provider.as_str(), "auto" | "autodevice"));
+    let cpu_only = execution_providers
+        .iter()
+        .all(|provider| provider.as_str() == "cpu");
+    let has_requested_eps = !requested_eps.is_empty();
+
+    let mut builder = Session::builder()
         .map_err(|err| anyhow!("failed to create ONNX session builder: {err}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|err| anyhow!("failed to set ONNX graph optimization level: {err}"))?
-        .with_auto_device(AutoDevicePolicy::MaxPerformance)
-        .map_err(|err| anyhow!("failed to enable ONNX Runtime auto device selection: {err}"))?
+        .map_err(|err| anyhow!("failed to set ONNX graph optimization level: {err}"))?;
+
+    if has_requested_eps {
+        builder = builder
+            .with_execution_providers(&requested_eps)
+            .map_err(|err| {
+                anyhow!(
+                    "failed to register ONNX execution providers for {}: {err}",
+                    path.display()
+                )
+            })?;
+    }
+
+    if use_auto_device || (!has_requested_eps && !cpu_only) {
+        builder = builder
+            .with_auto_device(AutoDevicePolicy::MaxPerformance)
+            .map_err(|err| anyhow!("failed to enable ONNX Runtime auto device selection: {err}"))?;
+    }
+
+    builder
         .commit_from_file(path)
         .map_err(|err| anyhow!("failed to load ONNX model {}: {err}", path.display()))
+}
+
+fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<ExecutionProviderDispatch> {
+    execution_providers
+        .iter()
+        .filter_map(|provider| match provider.as_str() {
+            "coreml" => Some(
+                ep::CoreML::default()
+                    .with_compute_units(ep::coreml::ComputeUnits::All)
+                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                    .with_low_precision_accumulation_on_gpu(true)
+                    .build(),
+            ),
+            "coremlgpu" => Some(
+                ep::CoreML::default()
+                    .with_compute_units(ep::coreml::ComputeUnits::CPUAndGPU)
+                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                    .with_low_precision_accumulation_on_gpu(true)
+                    .build(),
+            ),
+            "coremlnpu" | "coremlane" | "ane" | "npu" => Some(
+                ep::CoreML::default()
+                    .with_compute_units(ep::coreml::ComputeUnits::CPUAndNeuralEngine)
+                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                    .build(),
+            ),
+            "xnnpack" => Some(ep::XNNPACK::default().build()),
+            "auto" | "autodevice" | "cpu" => None,
+            other => {
+                warn!("unknown execution provider `{other}` ignored");
+                None
+            }
+        })
+        .collect()
 }
 
 fn preprocess_image(image: DynamicImage) -> anyhow::Result<Vec<f32>> {
