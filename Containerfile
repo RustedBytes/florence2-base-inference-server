@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1-bookworm AS builder
+FROM docker.io/library/rust:1-trixie AS builder
 
 ARG APP_NAME=florence2-base-inference-server
 
@@ -7,6 +7,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        g++ \
         libssl-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -24,13 +25,14 @@ RUN set -eux; \
         \( -name '*.so' -o -name '*.so.*' \) \
         -exec cp -L '{}' /out/lib/ \;
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:trixie-slim AS runtime
 
 ARG APP_NAME=florence2-base-inference-server
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        libstdc++6 \
         libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /app --create-home --shell /usr/sbin/nologin florence
