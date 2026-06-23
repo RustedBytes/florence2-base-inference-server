@@ -29,6 +29,45 @@ pub struct JobRequest {
     pub task: TaskSpec,
 }
 
+#[derive(Clone)]
+pub struct WebhookClient {
+    http: reqwest::Client,
+}
+
+impl WebhookClient {
+    pub fn new() -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(WEBHOOK_TIMEOUT)
+            .build()
+            .context("failed to build webhook HTTP client")?;
+
+        Ok(Self { http })
+    }
+
+    async fn send(&self, record: &JobRecord) -> anyhow::Result<()> {
+        let Some(webhook_url) = record.webhook_url.as_deref() else {
+            return Ok(());
+        };
+
+        let response = self
+            .http
+            .post(webhook_url)
+            .json(record)
+            .send()
+            .await
+            .with_context(|| format!("failed to send webhook request to {webhook_url}"))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "webhook endpoint returned HTTP {}",
+                response.status()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecord>> {
     let mut jobs = HashMap::new();
     load_job_records(&config.submissions_jsonl, &mut jobs).await?;
@@ -248,6 +287,7 @@ pub fn start_workers(
     jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
     workers: Arc<WorkerPoolState>,
     metrics: Arc<AppMetrics>,
+    webhooks: Arc<WebhookClient>,
     queue_rx: Receiver<JobRequest>,
 ) {
     info!("starting model worker pool workers={}", config.workers);
@@ -257,6 +297,7 @@ pub fn start_workers(
         let jobs = Arc::clone(&jobs);
         let workers = Arc::clone(&workers);
         let metrics = Arc::clone(&metrics);
+        let webhooks = Arc::clone(&webhooks);
         let queue_rx = queue_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -311,12 +352,13 @@ pub fn start_workers(
                             Ok((_, returned_worker, Ok(metadata))) => {
                                 worker = returned_worker;
                                 metrics.record_job_succeeded(elapsed_ms);
-                                finish_job(&config, &jobs, request.id, Ok(metadata)).await;
+                                finish_job(&config, &jobs, &webhooks, request.id, Ok(metadata))
+                                    .await;
                             }
                             Ok((_, returned_worker, Err(err))) => {
                                 worker = returned_worker;
                                 metrics.record_job_failed(elapsed_ms);
-                                finish_job(&config, &jobs, request.id, Err(err)).await;
+                                finish_job(&config, &jobs, &webhooks, request.id, Err(err)).await;
                             }
                             Err(err) => {
                                 metrics.record_job_failed(elapsed_ms);
@@ -324,6 +366,7 @@ pub fn start_workers(
                                 finish_job(
                                     &config,
                                     &jobs,
+                                    &webhooks,
                                     request.id,
                                     Err(anyhow!("worker task failed: {err}")),
                                 )
@@ -338,6 +381,7 @@ pub fn start_workers(
                             finish_job(
                                 &config,
                                 &jobs,
+                                &webhooks,
                                 request.id,
                                 Err(anyhow!(
                                     "job timed out after {} seconds",
@@ -441,6 +485,7 @@ async fn mark_running(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) {
 async fn finish_job(
     config: &Config,
     jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+    webhooks: &WebhookClient,
     id: Uuid,
     result: anyhow::Result<InferenceMetadata>,
 ) {
@@ -481,7 +526,7 @@ async fn finish_job(
                 config.results_jsonl.display()
             );
         }
-        send_webhook(&record).await;
+        send_webhook(webhooks, &record).await;
         cleanup_job_artifacts(config, &record).await;
         {
             let mut jobs = jobs.write().await;
@@ -492,39 +537,18 @@ async fn finish_job(
     }
 }
 
-async fn send_webhook(record: &JobRecord) {
+async fn send_webhook(webhooks: &WebhookClient, record: &JobRecord) {
     let Some(webhook_url) = record.webhook_url.as_deref() else {
         return;
     };
 
-    match post_webhook(webhook_url, record).await {
+    match webhooks.send(record).await {
         Ok(()) => info!("webhook delivered job_id={} url={}", record.id, webhook_url),
         Err(err) => warn!(
             "webhook delivery failed job_id={} url={} error={}",
             record.id, webhook_url, err
         ),
     }
-}
-
-async fn post_webhook(webhook_url: &str, record: &JobRecord) -> anyhow::Result<()> {
-    let response = reqwest::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .build()
-        .context("failed to build webhook HTTP client")?
-        .post(webhook_url)
-        .json(record)
-        .send()
-        .await
-        .with_context(|| format!("failed to send webhook request to {webhook_url}"))?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "webhook endpoint returned HTTP {}",
-            response.status()
-        ));
-    }
-
-    Ok(())
 }
 
 async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
@@ -754,7 +778,7 @@ mod tests {
         record.id = Uuid::new_v4();
         record.webhook_url = Some(url.clone());
 
-        post_webhook(&url, &record).await.unwrap();
+        WebhookClient::new().unwrap().send(&record).await.unwrap();
 
         let request = server.await.unwrap();
         let request = String::from_utf8(request).unwrap();
@@ -778,7 +802,15 @@ mod tests {
         let id = record.id;
         let jobs = RwLock::new(HashMap::from([(id, record)]));
 
-        finish_job(&config, &jobs, id, Err(anyhow!("inference failed"))).await;
+        let webhooks = WebhookClient::new().unwrap();
+        finish_job(
+            &config,
+            &jobs,
+            &webhooks,
+            id,
+            Err(anyhow!("inference failed")),
+        )
+        .await;
 
         let request = server.await.unwrap();
         let request = String::from_utf8(request).unwrap();

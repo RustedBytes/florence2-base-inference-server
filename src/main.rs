@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     config::Config,
     inference::validate_model_artifacts,
-    jobs::{load_jobs, start_workers},
+    jobs::{WebhookClient, load_jobs, start_workers},
 };
 
 #[derive(Debug, Parser)]
@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     let jobs = load_jobs(&config).await?;
     let workers = Arc::new(WorkerPoolState::new(config.workers));
     let metrics = Arc::new(AppMetrics::default());
+    let webhooks = Arc::new(WebhookClient::new()?);
     let state = AppState {
         config: Arc::clone(&config),
         queue_tx,
@@ -72,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state.jobs),
         workers,
         metrics,
+        webhooks,
         queue_rx,
     );
 
