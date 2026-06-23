@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     config.ensure_dirs().await?;
     validate_model_artifacts(&config.model_path, config.model_variant)?;
     debug!(
-        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} execution_providers={:?} rust_log={}",
+        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} allow_private_webhook_urls={} execution_providers={:?} rust_log={}",
         config.addr,
         config.model_path.display(),
         config.model_variant.as_str(),
@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         config.job_timeout_seconds,
         config.webhook_timeout_seconds,
         config.webhook_connect_timeout_seconds,
+        config.allow_private_webhook_urls,
         config.execution_providers,
         config.rust_log
     );
@@ -87,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to bind TCP listener")?;
 
     info!(
-        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} execution_providers={:?}",
+        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} allow_private_webhook_urls={} execution_providers={:?}",
         config.addr,
         config.workers,
         config.model_path.display(),
@@ -100,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         config.job_timeout_seconds,
         config.webhook_timeout_seconds,
         config.webhook_connect_timeout_seconds,
+        config.allow_private_webhook_urls,
         config.execution_providers
     );
 

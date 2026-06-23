@@ -47,6 +47,9 @@ job_timeout_seconds = 300
 webhook_timeout_seconds = 10
 webhook_connect_timeout_seconds = 5
 
+# Keep false unless this service runs in a trusted network and must call private webhook targets.
+allow_private_webhook_urls = false
+
 [runtime]
 # Supported values: auto, cpu, coreml, coreml_gpu, coreml_npu, xnnpack.
 # CUDA is also supported when the binary is built with `--features cuda`.

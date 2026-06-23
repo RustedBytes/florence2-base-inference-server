@@ -41,7 +41,7 @@ impl WebhookClient {
     }
 
     fn new(timeout_seconds: u64, connect_timeout_seconds: u64) -> anyhow::Result<Self> {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if timeout_seconds > 0 {
             builder = builder.timeout(Duration::from_secs(timeout_seconds));
         }
@@ -60,6 +60,7 @@ impl WebhookClient {
         let Some(webhook_url) = record.webhook_url.as_deref() else {
             return Ok(());
         };
+        let redacted_url = redacted_webhook_url(webhook_url);
 
         let response = self
             .http
@@ -67,7 +68,7 @@ impl WebhookClient {
             .json(record)
             .send()
             .await
-            .with_context(|| format!("failed to send webhook request to {webhook_url}"))?;
+            .with_context(|| format!("failed to send webhook request to {redacted_url}"))?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -553,14 +554,29 @@ async fn send_webhook(webhooks: &WebhookClient, record: &JobRecord) {
     let Some(webhook_url) = record.webhook_url.as_deref() else {
         return;
     };
+    let redacted_url = redacted_webhook_url(webhook_url);
 
     match webhooks.send(record).await {
-        Ok(()) => info!("webhook delivered job_id={} url={}", record.id, webhook_url),
+        Ok(()) => info!(
+            "webhook delivered job_id={} url={}",
+            record.id, redacted_url
+        ),
         Err(err) => warn!(
             "webhook delivery failed job_id={} url={} error={}",
-            record.id, webhook_url, err
+            record.id, redacted_url, err
         ),
     }
+}
+
+fn redacted_webhook_url(webhook_url: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(webhook_url) else {
+        return "<invalid webhook url>".to_string();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
 }
 
 async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
@@ -642,6 +658,7 @@ mod tests {
             job_timeout_seconds: 300,
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
+            allow_private_webhook_urls: false,
             execution_providers: vec!["cpu".to_string()],
         }
     }
@@ -808,6 +825,14 @@ mod tests {
         assert_eq!(body["id"], record.id.to_string());
         assert_eq!(body["status"], "succeeded");
         assert_eq!(body["webhook_url"], url);
+    }
+
+    #[test]
+    fn redacted_webhook_url_removes_sensitive_parts() {
+        let redacted =
+            redacted_webhook_url("https://user:secret@example.com/hook?token=secret#frag");
+
+        assert_eq!(redacted, "https://example.com/hook");
     }
 
     #[tokio::test]

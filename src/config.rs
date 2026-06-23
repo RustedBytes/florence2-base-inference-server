@@ -22,6 +22,7 @@ const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_WEBHOOK_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_ALLOW_PRIVATE_WEBHOOK_URLS: bool = false;
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -48,6 +49,7 @@ pub struct Config {
     pub request_timeout_seconds: u64,
     pub webhook_timeout_seconds: u64,
     pub webhook_connect_timeout_seconds: u64,
+    pub allow_private_webhook_urls: bool,
     pub execution_providers: Vec<String>,
 }
 
@@ -152,6 +154,11 @@ impl Config {
                 generation.webhook_connect_timeout_seconds,
                 DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS,
             )?,
+            allow_private_webhook_urls: bool_setting(
+                "ALLOW_PRIVATE_WEBHOOK_URLS",
+                generation.allow_private_webhook_urls,
+                DEFAULT_ALLOW_PRIVATE_WEBHOOK_URLS,
+            )?,
             execution_providers: execution_providers_setting(runtime.execution_providers),
         })
     }
@@ -245,6 +252,7 @@ struct GenerationConfig {
     job_timeout_seconds: Option<u64>,
     webhook_timeout_seconds: Option<u64>,
     webhook_connect_timeout_seconds: Option<u64>,
+    allow_private_webhook_urls: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -596,6 +604,7 @@ max_new_tokens = 32
 job_timeout_seconds = 45
 webhook_timeout_seconds = 12
 webhook_connect_timeout_seconds = 3
+allow_private_webhook_urls = true
 
 [runtime]
 execution_providers = ["coreml-gpu", "xnnpack"]
@@ -633,6 +642,7 @@ rust_log = "debug"
         assert_eq!(generation.job_timeout_seconds, Some(45));
         assert_eq!(generation.webhook_timeout_seconds, Some(12));
         assert_eq!(generation.webhook_connect_timeout_seconds, Some(3));
+        assert_eq!(generation.allow_private_webhook_urls, Some(true));
         assert_eq!(
             runtime.execution_providers,
             Some(vec!["coreml-gpu".to_string(), "xnnpack".to_string()])

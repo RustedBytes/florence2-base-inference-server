@@ -1,5 +1,6 @@
 use std::{
     io::Cursor,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -10,7 +11,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -28,6 +29,7 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::{
+    config::Config,
     jobs::{EnqueueError, enqueue_record},
     state::AppState,
     templates::IndexTemplate,
@@ -63,11 +65,13 @@ pub fn router(state: AppState) -> Router {
         ));
     }
 
-    if cors_allowed_origins.is_empty() {
+    let router = if cors_allowed_origins.is_empty() {
         router
     } else {
         router.layer(cors_layer(&cors_allowed_origins))
-    }
+    };
+
+    router.layer(middleware::from_fn(add_security_headers))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -280,7 +284,7 @@ async fn submit_multipart_job(
         }
     }
     let task = task_spec_from_request(task_type, task_prompt, text_input, None)?;
-    let webhook_url = validate_webhook_url(webhook_url)?;
+    let webhook_url = validate_webhook_url(&state.config, webhook_url)?;
 
     let image =
         image.ok_or_else(|| ApiError::BadRequest("multipart field `image` is required".into()))?;
@@ -386,7 +390,7 @@ async fn submit_inference_path(
         request.text_input,
         request.task,
     )?;
-    let webhook_url = validate_webhook_url(request.webhook_url)?;
+    let webhook_url = validate_webhook_url(&state.config, request.webhook_url)?;
     let filename = image_path
         .file_name()
         .map(|filename| filename.to_string_lossy().into_owned());
@@ -476,6 +480,40 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
+async fn add_security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
+        ),
+    );
+
+    response
+}
+
 fn task_spec_from_request(
     task_type: Option<String>,
     task_prompt: Option<String>,
@@ -486,7 +524,10 @@ fn task_spec_from_request(
         .map_err(|err| ApiError::BadRequest(err.to_string()))
 }
 
-fn validate_webhook_url(webhook_url: Option<String>) -> Result<Option<String>, ApiError> {
+fn validate_webhook_url(
+    config: &Config,
+    webhook_url: Option<String>,
+) -> Result<Option<String>, ApiError> {
     let Some(webhook_url) = webhook_url.map(|value| value.trim().to_string()) else {
         return Ok(None);
     };
@@ -496,17 +537,79 @@ fn validate_webhook_url(webhook_url: Option<String>) -> Result<Option<String>, A
 
     let parsed = reqwest::Url::parse(&webhook_url)
         .map_err(|err| ApiError::BadRequest(format!("invalid webhook_url: {err}")))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported webhook_url scheme `{scheme}`; expected http or https"
+            )));
+        }
+    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ApiError::BadRequest(
             "webhook_url must not include credentials".to_string(),
         ));
     }
-    match parsed.scheme() {
-        "http" | "https" => Ok(Some(parsed.to_string())),
-        scheme => Err(ApiError::BadRequest(format!(
-            "unsupported webhook_url scheme `{scheme}`; expected http or https"
-        ))),
+    if parsed.fragment().is_some() {
+        return Err(ApiError::BadRequest(
+            "webhook_url must not include a fragment".to_string(),
+        ));
     }
+    if !config.allow_private_webhook_urls {
+        validate_public_webhook_host(&parsed)?;
+    }
+    Ok(Some(parsed.to_string()))
+}
+
+fn validate_public_webhook_host(url: &reqwest::Url) -> Result<(), ApiError> {
+    let Some(host) = url.host_str() else {
+        return Err(ApiError::BadRequest(
+            "webhook_url must include a host".to_string(),
+        ));
+    };
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(ip) if ipv4_is_private_or_local(ip) => {
+                return Err(private_webhook_url_error());
+            }
+            IpAddr::V6(ip) if ipv6_is_private_or_local(ip) => {
+                return Err(private_webhook_url_error());
+            }
+            IpAddr::V4(_) | IpAddr::V6(_) => {}
+        }
+    } else {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".localhost") {
+            return Err(private_webhook_url_error());
+        }
+    }
+
+    Ok(())
+}
+
+fn private_webhook_url_error() -> ApiError {
+    ApiError::BadRequest(
+        "webhook_url targets a private or local address; set allow_private_webhook_urls for trusted deployments".to_string(),
+    )
+}
+
+fn ipv4_is_private_or_local(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.octets()[0] == 0
+}
+
+fn ipv6_is_private_or_local(ip: Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || matches!(ip.to_ipv4_mapped().map(IpAddr::V4), Some(IpAddr::V4(ip)) if ipv4_is_private_or_local(ip))
 }
 
 fn render_index(
@@ -905,15 +1008,23 @@ mod tests {
 
     #[test]
     fn validates_optional_webhook_url() {
-        let url = validate_webhook_url(Some(" http://example.com/hook ".to_string())).unwrap();
+        let state = test_state(false, Vec::new());
+        let url =
+            validate_webhook_url(&state.config, Some(" http://example.com/hook ".to_string()))
+                .unwrap();
 
         assert_eq!(url.as_deref(), Some("http://example.com/hook"));
-        assert_eq!(validate_webhook_url(Some("  ".to_string())).unwrap(), None);
+        assert_eq!(
+            validate_webhook_url(&state.config, Some("  ".to_string())).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn rejects_unsupported_webhook_url_scheme() {
-        let err = validate_webhook_url(Some("file:///tmp/hook".to_string())).unwrap_err();
+        let state = test_state(false, Vec::new());
+        let err =
+            validate_webhook_url(&state.config, Some("file:///tmp/hook".to_string())).unwrap_err();
 
         assert!(matches!(err, ApiError::BadRequest(_)));
         assert!(err.to_string().contains("expected http or https"));
@@ -921,11 +1032,38 @@ mod tests {
 
     #[test]
     fn rejects_webhook_url_credentials() {
-        let err = validate_webhook_url(Some("https://user:secret@example.com/hook".to_string()))
-            .unwrap_err();
+        let state = test_state(false, Vec::new());
+        let err = validate_webhook_url(
+            &state.config,
+            Some("https://user:secret@example.com/hook".to_string()),
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ApiError::BadRequest(_)));
         assert!(err.to_string().contains("must not include credentials"));
+    }
+
+    #[test]
+    fn rejects_private_webhook_urls_by_default() {
+        let state = test_state(false, Vec::new());
+        let err = validate_webhook_url(&state.config, Some("http://127.0.0.1/hook".to_string()))
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(err.to_string().contains("private or local address"));
+    }
+
+    #[test]
+    fn allows_private_webhook_urls_when_configured() {
+        let mut state = test_state(false, Vec::new());
+        Arc::get_mut(&mut state.config)
+            .unwrap()
+            .allow_private_webhook_urls = true;
+
+        let url =
+            validate_webhook_url(&state.config, Some("http://127.0.0.1/hook".to_string())).unwrap();
+
+        assert_eq!(url.as_deref(), Some("http://127.0.0.1/hook"));
     }
 
     #[tokio::test]
@@ -963,6 +1101,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_added_to_responses() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(middleware::from_fn(add_security_headers));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-frame-options")),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(HeaderName::from_static("content-security-policy"))
+        );
     }
 
     #[tokio::test]
@@ -1024,6 +1190,7 @@ mod tests {
                 job_timeout_seconds: 300,
                 webhook_timeout_seconds: 10,
                 webhook_connect_timeout_seconds: 5,
+                allow_private_webhook_urls: false,
                 execution_providers: vec!["cpu".to_string()],
             }),
             queue_tx,

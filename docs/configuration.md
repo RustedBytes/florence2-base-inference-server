@@ -47,6 +47,7 @@ max_new_tokens = 256
 job_timeout_seconds = 300
 webhook_timeout_seconds = 10
 webhook_connect_timeout_seconds = 5
+allow_private_webhook_urls = false
 
 [runtime]
 execution_providers = ["auto"]
@@ -119,6 +120,7 @@ Environment variables override TOML values when set:
 - `JOB_TIMEOUT_SECONDS`: per-job inference timeout; set to `0` to disable timeout enforcement
 - `WEBHOOK_TIMEOUT_SECONDS`: total outbound webhook request timeout; set to `0` to disable
 - `WEBHOOK_CONNECT_TIMEOUT_SECONDS`: outbound webhook connection timeout; set to `0` to disable
+- `ALLOW_PRIVATE_WEBHOOK_URLS`: set to `true` only in trusted deployments that must call local or private webhook targets
 - `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
@@ -152,3 +154,5 @@ Request validation happens before the image is decoded for inference:
 Jobs are marked failed if inference exceeds `generation.job_timeout_seconds`. A timed-out blocking inference task may finish in the background, so the worker slot is restarted before it accepts more work.
 
 Webhook delivery uses `generation.webhook_timeout_seconds` for the full request and `generation.webhook_connect_timeout_seconds` for establishing the connection. Webhook timeout failures are logged and do not change the completed job result.
+
+For SSRF protection, webhook URLs reject credentials, fragments, localhost, and literal private/local IP addresses by default. Redirects are not followed. If private webhook targets are required in a trusted network, set `generation.allow_private_webhook_urls = true`.
