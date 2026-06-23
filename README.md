@@ -11,3 +11,11 @@ Minimal Axum server for running Florence-2-base ONNX image-to-text inference in 
 - [Task fields](docs/tasks.md)
 - [Configuration](docs/configuration.md)
 - [Metadata and cleanup](docs/metadata-and-cleanup.md)
+
+## Author
+
+Yehor Smoliakov <egorsmkv@gmail.com>
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

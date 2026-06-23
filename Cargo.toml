@@ -2,6 +2,8 @@
 name = "florence2-base-inference-server"
 version = "0.1.0"
 edition = "2024"
+authors = ["Yehor Smoliakov <egorsmkv@gmail.com>"]
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.100"
