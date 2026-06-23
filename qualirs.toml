@@ -20,6 +20,13 @@ ignore_findings = [
     # Normal Arc/RwLock/HashMap state shapes are noisy here; refactors should be
     # driven by ownership clarity, not nesting count.
     "Q0040",
+    # Config is the resolved application settings carrier. Splitting it would
+    # add access indirection across startup, API, queue, and worker code without
+    # making invalid states more precise.
+    "Q0026",
+    # TaskPrompt mirrors Florence's finite public task vocabulary. The wide enum
+    # is intentional so unsupported prompts remain unrepresentable internally.
+    "Q0017",
     # Tiny helper inlining and short fluent crypto builders are style noise.
     "Q0066",
     "Q0037",

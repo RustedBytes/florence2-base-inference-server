@@ -1,13 +1,18 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::anyhow;
 use async_channel::bounded;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use super::*;
 use crate::{
-    config::ModelVariant,
-    state::{AppMetrics, RateLimiter, WorkerPoolState},
+    config::{Config, ModelVariant},
+    state::{AppMetrics, AppState, RateLimiter, WorkerPoolState},
+    types::{JobRecord, JobStatus, TaskSpec},
+    util::append_jsonl,
 };
 
 fn test_config() -> Config {
