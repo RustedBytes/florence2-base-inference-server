@@ -215,7 +215,8 @@ impl FlorenceWorker {
             self.id, image_features.shape, vision_elapsed_ms
         );
 
-        let generations = self.run_task_plan(&image_features, task)?;
+        let generations =
+            self.run_task_plan(&image_features, task, (original_width, original_height))?;
         let final_generation = generations
             .last()
             .cloned()
@@ -266,6 +267,7 @@ impl FlorenceWorker {
         &mut self,
         image_features: &TensorData,
         task: &TaskSpec,
+        image_size: (u32, u32),
     ) -> anyhow::Result<Vec<GenerationMetadata>> {
         if task.task_type == "Cascased task" {
             let caption_token = match task.task_prompt.as_str() {
@@ -275,16 +277,16 @@ impl FlorenceWorker {
                 other => return Err(anyhow!("unsupported cascased task prompt `{other}`")),
             };
             let caption = ResolvedTask::new(caption_token, None)?;
-            let first = self.generate_once(image_features, &caption)?;
+            let first = self.generate_once(image_features, &caption, image_size)?;
             let grounding_input = generation_text_for_input(&first);
             let grounding =
                 ResolvedTask::new("<CAPTION_TO_PHRASE_GROUNDING>", Some(grounding_input))?;
-            let second = self.generate_once(image_features, &grounding)?;
+            let second = self.generate_once(image_features, &grounding, image_size)?;
             return Ok(vec![first, second]);
         }
 
         let resolved = ResolvedTask::from_task_spec(task)?;
-        self.generate_once(image_features, &resolved)
+        self.generate_once(image_features, &resolved, image_size)
             .map(|step| vec![step])
     }
 
@@ -292,6 +294,7 @@ impl FlorenceWorker {
         &mut self,
         image_features: &TensorData,
         task: &ResolvedTask,
+        image_size: (u32, u32),
     ) -> anyhow::Result<GenerationMetadata> {
         let prompt_ids = self.encode_prompt(&task.prompt_text)?;
         let text_embeds = self.run_embed_tokens(&prompt_ids)?;
@@ -324,7 +327,7 @@ impl FlorenceWorker {
             .decode(&generated_u32, false)
             .map_err(|err| anyhow!("failed to decode generated tokens: {err}"))?;
         let generated_text = clean_generated_text(&raw_text);
-        let result = json!({ task.task_token.clone(): generated_text.clone() });
+        let result = post_process_generation(&task.task_token, &generated_text, image_size);
 
         debug!(
             "generation step completed worker_id={} task_token={} prompt_ids={} generated_tokens={}",
@@ -901,6 +904,115 @@ fn combine_generation_results(generations: &[GenerationMetadata]) -> Value {
     Value::Object(output)
 }
 
+fn post_process_generation(
+    task_token: &str,
+    generated_text: &str,
+    image_size: (u32, u32),
+) -> Value {
+    if task_token != "<OCR_WITH_REGION>" {
+        return json!({ task_token: generated_text });
+    }
+
+    let items = parse_ocr_regions(generated_text, image_size);
+    if items.is_empty() {
+        return json!({ task_token: generated_text });
+    }
+
+    json!({
+        task_token: {
+            "raw": generated_text,
+            "items": items,
+        }
+    })
+}
+
+fn parse_ocr_regions(generated_text: &str, image_size: (u32, u32)) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative_loc_start) = generated_text[cursor..].find("<loc_") {
+        let loc_start = cursor + relative_loc_start;
+        let text = generated_text[cursor..loc_start].trim().to_string();
+        let mut loc_tokens = Vec::new();
+        let mut loc_cursor = loc_start;
+
+        while let Some((loc, next_cursor)) = parse_loc_token_at(generated_text, loc_cursor) {
+            loc_tokens.push(loc);
+            loc_cursor = next_cursor;
+        }
+
+        if !loc_tokens.is_empty() {
+            if let Some(item) = ocr_region_item(text, loc_tokens, image_size) {
+                items.push(item);
+            }
+        }
+
+        cursor = loc_cursor;
+    }
+
+    items
+}
+
+fn parse_loc_token_at(input: &str, cursor: usize) -> Option<(u16, usize)> {
+    let remaining = input.get(cursor..)?;
+    let remaining = remaining.strip_prefix("<loc_")?;
+    let end = remaining.find('>')?;
+    let loc = remaining[..end].parse::<u16>().ok()?;
+    Some((loc.min(999), cursor + "<loc_".len() + end + 1))
+}
+
+fn ocr_region_item(text: String, loc_tokens: Vec<u16>, image_size: (u32, u32)) -> Option<Value> {
+    let points = loc_tokens
+        .chunks_exact(2)
+        .map(|pair| {
+            let x = scale_loc(pair[0], image_size.0);
+            let y = scale_loc(pair[1], image_size.1);
+            (x, y)
+        })
+        .collect::<Vec<_>>();
+
+    if points.len() < 2 {
+        return None;
+    }
+
+    let (mut x_min, mut y_min) = points[0];
+    let (mut x_max, mut y_max) = points[0];
+    for &(x, y) in &points[1..] {
+        x_min = x_min.min(x);
+        y_min = y_min.min(y);
+        x_max = x_max.max(x);
+        y_max = y_max.max(y);
+    }
+
+    let polygon = points
+        .iter()
+        .map(|(x, y)| json!({ "x": x, "y": y }))
+        .collect::<Vec<_>>();
+
+    Some(json!({
+        "text": text,
+        "bbox": {
+            "x_min": x_min,
+            "y_min": y_min,
+            "x_max": x_max,
+            "y_max": y_max,
+            "width": round3(x_max - x_min),
+            "height": round3(y_max - y_min),
+        },
+        "bbox_xyxy": [x_min, y_min, x_max, y_max],
+        "polygon": polygon,
+        "loc_tokens": loc_tokens,
+    }))
+}
+
+fn scale_loc(value: u16, image_side: u32) -> f64 {
+    round3((f64::from(value) / 999.0) * f64::from(image_side))
+}
+
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
 fn clean_generated_text(raw: &str) -> String {
     raw.replace("<s>", "")
         .replace("</s>", "")
@@ -951,5 +1063,28 @@ fn tensor_metadata_f32(name: &str, shape: &Shape, data: &[f32]) -> TensorMetadat
         mean: (!data.is_empty()).then_some((sum / data.len() as f64) as f32),
         min: (!data.is_empty()).then_some(min),
         max: (!data.is_empty()).then_some(max),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ocr_region_location_tokens_into_bbox() {
+        let generated =
+            "let x = 5:<loc_213><loc_402><loc_789><loc_402><loc_789><loc_503><loc_213><loc_502>";
+
+        let result = post_process_generation("<OCR_WITH_REGION>", generated, (1254, 1254));
+        let item = &result["<OCR_WITH_REGION>"]["items"][0];
+
+        assert_eq!(item["text"], "let x = 5:");
+        assert_eq!(item["loc_tokens"][0], 213);
+        assert_eq!(item["loc_tokens"][7], 502);
+        assert_eq!(item["bbox"]["x_min"], 267.369);
+        assert_eq!(item["bbox"]["y_min"], 504.613);
+        assert_eq!(item["bbox"]["x_max"], 990.396);
+        assert_eq!(item["bbox"]["y_max"], 631.393);
+        assert_eq!(item["polygon"].as_array().unwrap().len(), 4);
     }
 }
