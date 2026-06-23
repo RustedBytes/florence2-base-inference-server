@@ -2,6 +2,8 @@
 
 Minimal Axum server for running Florence-2-base ONNX image-to-text inference in a background worker queue.
 
+![Florence-2 inference server preview](docs/demo.jpg)
+
 ## Documentation
 
 - [Model files](docs/model-files.md)
