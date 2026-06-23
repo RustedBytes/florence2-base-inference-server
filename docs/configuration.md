@@ -32,6 +32,7 @@ variant = "fp32"
 model_pool_size = 1
 queue_size = 128
 body_limit_bytes = 33554432
+request_timeout_seconds = 60
 
 [retention]
 job_retention_limit = 1000
@@ -44,6 +45,8 @@ max_image_height = 8192
 [generation]
 max_new_tokens = 256
 job_timeout_seconds = 300
+webhook_timeout_seconds = 10
+webhook_connect_timeout_seconds = 5
 
 [runtime]
 execution_providers = ["auto"]
@@ -105,6 +108,7 @@ Environment variables override TOML values when set:
 - `MODEL_POOL_SIZE`: number of model workers
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: multipart upload limit
+- `REQUEST_TIMEOUT_SECONDS`: whole HTTP request timeout; set to `0` to disable timeout enforcement
 - `JOB_RETENTION_LIMIT`: maximum in-memory job records kept queryable through `/v1/jobs/{id}`
 - `METADATA_RETENTION_LIMIT`: maximum latest metadata records kept when JSONL files are compacted at startup; set to `0` to disable compaction
 - `MAX_IMAGE_WIDTH`: maximum accepted image width before decode
@@ -113,6 +117,8 @@ Environment variables override TOML values when set:
 - `MODEL_PATH`: explicit ONNX model path, overrides `MODEL_VARIANT` path selection
 - `MAX_NEW_TOKENS`: maximum decoder tokens per generation
 - `JOB_TIMEOUT_SECONDS`: per-job inference timeout; set to `0` to disable timeout enforcement
+- `WEBHOOK_TIMEOUT_SECONDS`: total outbound webhook request timeout; set to `0` to disable
+- `WEBHOOK_CONNECT_TIMEOUT_SECONDS`: outbound webhook connection timeout; set to `0` to disable
 - `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
@@ -139,7 +145,10 @@ Only `GET`, `POST`, and `OPTIONS` methods are allowed by the CORS layer.
 Request validation happens before the image is decoded for inference:
 
 - `queue.body_limit_bytes` limits multipart upload size.
+- `queue.request_timeout_seconds` limits total HTTP request handling time and returns `408 Request Timeout`.
 - `validation.max_image_width` and `validation.max_image_height` reject oversized image dimensions.
 - Only supported image formats with `image/*` content types are accepted.
 
 Jobs are marked failed if inference exceeds `generation.job_timeout_seconds`. A timed-out blocking inference task may finish in the background, so the worker slot is restarted before it accepts more work.
+
+Webhook delivery uses `generation.webhook_timeout_seconds` for the full request and `generation.webhook_connect_timeout_seconds` for establishing the connection. Webhook timeout failures are logged and do not change the completed job result.

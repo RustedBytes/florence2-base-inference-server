@@ -19,6 +19,9 @@ const DEFAULT_METADATA_RETENTION_LIMIT: usize = 10_000;
 const DEFAULT_MAX_IMAGE_WIDTH: u32 = 8192;
 const DEFAULT_MAX_IMAGE_HEIGHT: u32 = 8192;
 const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_WEBHOOK_TIMEOUT_SECONDS: u64 = 10;
+const DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -42,6 +45,9 @@ pub struct Config {
     pub rust_log: String,
     pub max_new_tokens: usize,
     pub job_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub webhook_timeout_seconds: u64,
+    pub webhook_connect_timeout_seconds: u64,
     pub execution_providers: Vec<String>,
 }
 
@@ -119,6 +125,11 @@ impl Config {
                 queue.body_limit_bytes,
                 DEFAULT_BODY_LIMIT_BYTES,
             )?,
+            request_timeout_seconds: u64_setting(
+                "REQUEST_TIMEOUT_SECONDS",
+                queue.request_timeout_seconds,
+                DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            )?,
             rust_log: string_setting("RUST_LOG", logging.rust_log, DEFAULT_RUST_LOG),
             max_new_tokens: usize_setting(
                 "MAX_NEW_TOKENS",
@@ -130,6 +141,16 @@ impl Config {
                 "JOB_TIMEOUT_SECONDS",
                 generation.job_timeout_seconds,
                 DEFAULT_JOB_TIMEOUT_SECONDS,
+            )?,
+            webhook_timeout_seconds: u64_setting(
+                "WEBHOOK_TIMEOUT_SECONDS",
+                generation.webhook_timeout_seconds,
+                DEFAULT_WEBHOOK_TIMEOUT_SECONDS,
+            )?,
+            webhook_connect_timeout_seconds: u64_setting(
+                "WEBHOOK_CONNECT_TIMEOUT_SECONDS",
+                generation.webhook_connect_timeout_seconds,
+                DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS,
             )?,
             execution_providers: execution_providers_setting(runtime.execution_providers),
         })
@@ -215,12 +236,15 @@ struct QueueConfig {
     model_pool_size: Option<usize>,
     queue_size: Option<usize>,
     body_limit_bytes: Option<usize>,
+    request_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct GenerationConfig {
     max_new_tokens: Option<usize>,
     job_timeout_seconds: Option<u64>,
+    webhook_timeout_seconds: Option<u64>,
+    webhook_connect_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -557,6 +581,7 @@ variant = "q4-f16"
 model_pool_size = 2
 queue_size = 8
 body_limit_bytes = 4096
+request_timeout_seconds = 20
 
 [retention]
 job_retention_limit = 64
@@ -569,6 +594,8 @@ max_image_height = 480
 [generation]
 max_new_tokens = 32
 job_timeout_seconds = 45
+webhook_timeout_seconds = 12
+webhook_connect_timeout_seconds = 3
 
 [runtime]
 execution_providers = ["coreml-gpu", "xnnpack"]
@@ -597,12 +624,15 @@ rust_log = "debug"
         assert_eq!(queue.model_pool_size, Some(2));
         assert_eq!(queue.queue_size, Some(8));
         assert_eq!(queue.body_limit_bytes, Some(4096));
+        assert_eq!(queue.request_timeout_seconds, Some(20));
         assert_eq!(retention.job_retention_limit, Some(64));
         assert_eq!(retention.metadata_retention_limit, Some(128));
         assert_eq!(validation.max_image_width, Some(640));
         assert_eq!(validation.max_image_height, Some(480));
         assert_eq!(generation.max_new_tokens, Some(32));
         assert_eq!(generation.job_timeout_seconds, Some(45));
+        assert_eq!(generation.webhook_timeout_seconds, Some(12));
+        assert_eq!(generation.webhook_connect_timeout_seconds, Some(3));
         assert_eq!(
             runtime.execution_providers,
             Some(vec!["coreml-gpu".to_string(), "xnnpack".to_string()])

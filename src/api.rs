@@ -1,4 +1,8 @@
-use std::{io::Cursor, path::PathBuf, time::Instant};
+use std::{
+    io::Cursor,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use askama::Template;
@@ -17,7 +21,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::fs;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    timeout::TimeoutLayer,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -32,9 +39,10 @@ use crate::{
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
 
-pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
+pub fn router(state: AppState) -> Router {
     let cors_allowed_origins = state.config.cors_allowed_origins.clone();
-    let router = Router::new()
+    let request_timeout_seconds = state.config.request_timeout_seconds;
+    let mut router = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ready", get(readiness))
@@ -44,9 +52,16 @@ pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
         .route("/infer-form", post(submit_inference_form))
         .route("/v1/infer/path", post(submit_inference_path))
         .route("/v1/jobs/{id}", get(get_job))
-        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        .layer(DefaultBodyLimit::max(state.config.body_limit_bytes))
         .layer(middleware::from_fn(log_request))
         .with_state(state);
+
+    if request_timeout_seconds > 0 {
+        router = router.layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(request_timeout_seconds),
+        ));
+    }
 
     if cors_allowed_origins.is_empty() {
         router
@@ -777,7 +792,9 @@ mod tests {
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
     use async_channel::bounded;
+    use axum::body::Body;
     use tokio::sync::RwLock;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::{
@@ -926,6 +943,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timeout_layer_returns_408() {
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    "ok"
+                }),
+            )
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                Duration::from_millis(1),
+            ));
+
+        let response = app
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
     async fn local_path_endpoint_is_disabled_by_default() {
         let state = test_state(false, Vec::new());
         let path = std::env::temp_dir().join(format!("florence2-api-test-{}", Uuid::new_v4()));
@@ -978,9 +1018,12 @@ mod tests {
                 workers: 1,
                 queue_size: 1,
                 body_limit_bytes: 1024,
+                request_timeout_seconds: 60,
                 rust_log: "info".to_string(),
                 max_new_tokens: 1,
                 job_timeout_seconds: 300,
+                webhook_timeout_seconds: 10,
+                webhook_connect_timeout_seconds: 5,
                 execution_providers: vec!["cpu".to_string()],
             }),
             queue_tx,

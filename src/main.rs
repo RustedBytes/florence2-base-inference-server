@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     config.ensure_dirs().await?;
     validate_model_artifacts(&config.model_path, config.model_variant)?;
     debug!(
-        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} max_new_tokens={} execution_providers={:?} rust_log={}",
+        "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} execution_providers={:?} rust_log={}",
         config.addr,
         config.model_path.display(),
         config.model_variant.as_str(),
@@ -50,7 +50,11 @@ async fn main() -> anyhow::Result<()> {
         config.workers,
         config.queue_size,
         config.body_limit_bytes,
+        config.request_timeout_seconds,
         config.max_new_tokens,
+        config.job_timeout_seconds,
+        config.webhook_timeout_seconds,
+        config.webhook_connect_timeout_seconds,
         config.execution_providers,
         config.rust_log
     );
@@ -59,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let jobs = load_jobs(&config).await?;
     let workers = Arc::new(WorkerPoolState::new(config.workers));
     let metrics = Arc::new(AppMetrics::default());
-    let webhooks = Arc::new(WebhookClient::new()?);
+    let webhooks = Arc::new(WebhookClient::from_config(&config)?);
     let state = AppState {
         config: Arc::clone(&config),
         queue_tx,
@@ -77,13 +81,13 @@ async fn main() -> anyhow::Result<()> {
         queue_rx,
     );
 
-    let app = api::router(state, config.body_limit_bytes);
+    let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(config.addr)
         .await
         .context("failed to bind TCP listener")?;
 
     info!(
-        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} max_new_tokens={} execution_providers={:?}",
+        "server listening addr={} workers={} model={} model_variant={} data_dir={} queue_size={} body_limit_bytes={} request_timeout_seconds={} max_new_tokens={} job_timeout_seconds={} webhook_timeout_seconds={} webhook_connect_timeout_seconds={} execution_providers={:?}",
         config.addr,
         config.workers,
         config.model_path.display(),
@@ -91,7 +95,11 @@ async fn main() -> anyhow::Result<()> {
         config.data_dir.display(),
         config.queue_size,
         config.body_limit_bytes,
+        config.request_timeout_seconds,
         config.max_new_tokens,
+        config.job_timeout_seconds,
+        config.webhook_timeout_seconds,
+        config.webhook_connect_timeout_seconds,
         config.execution_providers
     );
 

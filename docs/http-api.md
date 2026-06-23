@@ -67,4 +67,4 @@ Errors use a stable JSON shape:
 
 Known error codes are `bad_request`, `not_found`, `forbidden`, `service_unavailable`, and `internal_error`.
 
-Inference submissions return `503` when no model worker is ready, when the queue is full, or when the queue has closed. Uploads are rejected before inference if they exceed the configured body limit, have an unsupported content type or format, or exceed the configured image dimensions.
+Requests return `408` if they exceed the configured `queue.request_timeout_seconds` limit. Inference submissions return `503` when no model worker is ready, when the queue is full, or when the queue has closed. Uploads are rejected before inference if they exceed the configured body limit, have an unsupported content type or format, or exceed the configured image dimensions.

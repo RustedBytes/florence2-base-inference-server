@@ -20,8 +20,6 @@ use crate::{
     util::append_jsonl,
 };
 
-const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Debug, Clone)]
 pub struct JobRequest {
     pub id: Uuid,
@@ -35,9 +33,23 @@ pub struct WebhookClient {
 }
 
 impl WebhookClient {
-    pub fn new() -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(WEBHOOK_TIMEOUT)
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        Self::new(
+            config.webhook_timeout_seconds,
+            config.webhook_connect_timeout_seconds,
+        )
+    }
+
+    fn new(timeout_seconds: u64, connect_timeout_seconds: u64) -> anyhow::Result<Self> {
+        let mut builder = reqwest::Client::builder();
+        if timeout_seconds > 0 {
+            builder = builder.timeout(Duration::from_secs(timeout_seconds));
+        }
+        if connect_timeout_seconds > 0 {
+            builder = builder.connect_timeout(Duration::from_secs(connect_timeout_seconds));
+        }
+
+        let http = builder
             .build()
             .context("failed to build webhook HTTP client")?;
 
@@ -624,9 +636,12 @@ mod tests {
             workers: 1,
             queue_size: 1,
             body_limit_bytes: 1024,
+            request_timeout_seconds: 60,
             rust_log: "info".to_string(),
             max_new_tokens: 1,
             job_timeout_seconds: 300,
+            webhook_timeout_seconds: 10,
+            webhook_connect_timeout_seconds: 5,
             execution_providers: vec!["cpu".to_string()],
         }
     }
@@ -778,7 +793,11 @@ mod tests {
         record.id = Uuid::new_v4();
         record.webhook_url = Some(url.clone());
 
-        WebhookClient::new().unwrap().send(&record).await.unwrap();
+        WebhookClient::new(10, 5)
+            .unwrap()
+            .send(&record)
+            .await
+            .unwrap();
 
         let request = server.await.unwrap();
         let request = String::from_utf8(request).unwrap();
@@ -802,7 +821,7 @@ mod tests {
         let id = record.id;
         let jobs = RwLock::new(HashMap::from([(id, record)]));
 
-        let webhooks = WebhookClient::new().unwrap();
+        let webhooks = WebhookClient::new(10, 5).unwrap();
         finish_job(
             &config,
             &jobs,

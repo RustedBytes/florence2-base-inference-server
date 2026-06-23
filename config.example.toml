@@ -22,6 +22,9 @@ model_pool_size = 1
 queue_size = 128
 body_limit_bytes = 33554432
 
+# Set to 0 to disable whole-request timeout enforcement.
+request_timeout_seconds = 60
+
 [retention]
 # Limits how many jobs stay queryable in memory. Set to 0 to retain none.
 job_retention_limit = 1000
@@ -39,6 +42,10 @@ max_new_tokens = 256
 
 # Set to 0 to disable per-job timeout enforcement.
 job_timeout_seconds = 300
+
+# Set either value to 0 to disable that webhook timeout.
+webhook_timeout_seconds = 10
+webhook_connect_timeout_seconds = 5
 
 [runtime]
 # Supported values: auto, cpu, coreml, coreml_gpu, coreml_npu, xnnpack.
