@@ -630,8 +630,21 @@ fn load_session(path: &Path, execution_providers: &[String]) -> anyhow::Result<S
     // Silicon but still spend a long time compiling unsupported dynamic graphs.
     let mut builder = Session::builder()
         .map_err(|err| anyhow!("failed to create ONNX session builder: {err}"))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|err| anyhow!("failed to set ONNX graph optimization level: {err}"))?;
+        .with_optimization_level(GraphOptimizationLevel::All)
+        .map_err(|err| anyhow!("failed to set ONNX graph optimization level: {err}"))?
+        .with_prepacking(true)
+        .map_err(|err| anyhow!("failed to enable ONNX prepacking: {err}"))?
+        .with_memory_pattern(false)
+        .map_err(|err| anyhow!("failed to configure ONNX memory pattern optimization: {err}"))?;
+
+    if execution_providers
+        .iter()
+        .any(|provider| provider.as_str() == "cuda")
+    {
+        builder = builder
+            .with_device_allocated_initializers()
+            .map_err(|err| anyhow!("failed to enable ONNX device-allocated initializers: {err}"))?;
+    }
 
     if has_requested_eps {
         builder = builder
@@ -692,7 +705,13 @@ fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<Executio
 
 #[cfg(feature = "cuda")]
 fn cuda_execution_provider() -> Option<ExecutionProviderDispatch> {
-    Some(ep::CUDA::default().build())
+    Some(
+        ep::CUDA::default()
+            .with_tf32(true)
+            .with_prefer_nhwc(true)
+            .with_conv_max_workspace(true)
+            .build(),
+    )
 }
 
 #[cfg(not(feature = "cuda"))]
