@@ -22,8 +22,23 @@ model_pool_size = 1
 queue_size = 128
 body_limit_bytes = 33554432
 
+[retention]
+# Limits how many jobs stay queryable in memory. Set to 0 to retain none.
+job_retention_limit = 1000
+
+# Limits how many latest metadata records are kept when JSONL files are compacted at startup.
+# Set to 0 to disable metadata compaction.
+metadata_retention_limit = 10000
+
+[validation]
+max_image_width = 8192
+max_image_height = 8192
+
 [generation]
 max_new_tokens = 256
+
+# Set to 0 to disable per-job timeout enforcement.
+job_timeout_seconds = 300
 
 [runtime]
 # Supported values: auto, cpu, coreml, coreml_gpu, coreml_npu, xnnpack.

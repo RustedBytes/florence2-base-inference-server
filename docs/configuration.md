@@ -33,8 +33,17 @@ model_pool_size = 1
 queue_size = 128
 body_limit_bytes = 33554432
 
+[retention]
+job_retention_limit = 1000
+metadata_retention_limit = 10000
+
+[validation]
+max_image_width = 8192
+max_image_height = 8192
+
 [generation]
 max_new_tokens = 256
+job_timeout_seconds = 300
 
 [runtime]
 execution_providers = ["auto"]
@@ -96,9 +105,14 @@ Environment variables override TOML values when set:
 - `MODEL_POOL_SIZE`: number of model workers
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: multipart upload limit
+- `JOB_RETENTION_LIMIT`: maximum in-memory job records kept queryable through `/v1/jobs/{id}`
+- `METADATA_RETENTION_LIMIT`: maximum latest metadata records kept when JSONL files are compacted at startup; set to `0` to disable compaction
+- `MAX_IMAGE_WIDTH`: maximum accepted image width before decode
+- `MAX_IMAGE_HEIGHT`: maximum accepted image height before decode
 - `MODEL_VARIANT`: model variant
 - `MODEL_PATH`: explicit ONNX model path, overrides `MODEL_VARIANT` path selection
 - `MAX_NEW_TOKENS`: maximum decoder tokens per generation
+- `JOB_TIMEOUT_SECONDS`: per-job inference timeout; set to `0` to disable timeout enforcement
 - `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
@@ -121,3 +135,11 @@ cors_allowed_origins = ["http://localhost:5173"]
 ```
 
 Only `GET`, `POST`, and `OPTIONS` methods are allowed by the CORS layer.
+
+Request validation happens before the image is decoded for inference:
+
+- `queue.body_limit_bytes` limits multipart upload size.
+- `validation.max_image_width` and `validation.max_image_height` reject oversized image dimensions.
+- Only supported image formats with `image/*` content types are accepted.
+
+Jobs are marked failed if inference exceeds `generation.job_timeout_seconds`. A timed-out blocking inference task may finish in the background, so the worker slot is restarted before it accepts more work.

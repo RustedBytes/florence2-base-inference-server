@@ -3,6 +3,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     inference::FlorenceWorker,
-    state::{AppState, WorkerPoolState},
+    state::{AppMetrics, AppState, WorkerPoolState},
     types::{InferenceMetadata, JobRecord, JobStatus, QueueResponse, TaskSpec},
     util::append_jsonl,
 };
@@ -52,6 +53,9 @@ pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecor
             })?;
     }
 
+    compact_metadata(config, &jobs).await?;
+    retain_recent_jobs(&mut jobs, config.job_retention_limit);
+
     Ok(jobs)
 }
 
@@ -79,6 +83,62 @@ async fn load_job_records(path: &Path, jobs: &mut HashMap<Uuid, JobRecord>) -> a
     }
 
     Ok(())
+}
+
+async fn compact_metadata(config: &Config, jobs: &HashMap<Uuid, JobRecord>) -> anyhow::Result<()> {
+    if config.metadata_retention_limit == 0 {
+        return Ok(());
+    }
+
+    let records = recent_records(jobs, config.metadata_retention_limit);
+    let (submissions, results): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|record| matches!(record.status, JobStatus::Queued | JobStatus::Running));
+
+    write_jsonl_records(&config.submissions_jsonl, &submissions).await?;
+    write_jsonl_records(&config.results_jsonl, &results).await?;
+    Ok(())
+}
+
+async fn write_jsonl_records(path: &Path, records: &[JobRecord]) -> anyhow::Result<()> {
+    let temp_path = path.with_extension("jsonl.tmp");
+    let mut bytes = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut bytes, record)?;
+        bytes.push(b'\n');
+    }
+    tokio::fs::write(&temp_path, bytes)
+        .await
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
+
+fn retain_recent_jobs(jobs: &mut HashMap<Uuid, JobRecord>, limit: usize) {
+    if jobs.len() <= limit {
+        return;
+    }
+    if limit == 0 {
+        jobs.clear();
+        return;
+    }
+
+    let keep = recent_records(jobs, limit)
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<std::collections::HashSet<_>>();
+    jobs.retain(|id, _| keep.contains(id));
+}
+
+fn recent_records(jobs: &HashMap<Uuid, JobRecord>, limit: usize) -> Vec<JobRecord> {
+    let mut records = jobs.values().cloned().collect::<Vec<_>>();
+    records.sort_by_key(|record| record.updated_at);
+    records.reverse();
+    records.truncate(limit);
+    records.reverse();
+    records
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,6 +245,7 @@ pub fn start_workers(
     config: Arc<Config>,
     jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
     workers: Arc<WorkerPoolState>,
+    metrics: Arc<AppMetrics>,
     queue_rx: Receiver<JobRequest>,
 ) {
     info!("starting model worker pool workers={}", config.workers);
@@ -193,85 +254,170 @@ pub fn start_workers(
         let config = Arc::clone(&config);
         let jobs = Arc::clone(&jobs);
         let workers = Arc::clone(&workers);
+        let metrics = Arc::clone(&metrics);
         let queue_rx = queue_rx.clone();
         tokio::spawn(async move {
-            let worker = tokio::task::spawn_blocking({
-                let config = Arc::clone(&config);
-                move || FlorenceWorker::new(worker_id, config)
-            })
-            .await;
-
-            let mut worker = match worker {
-                Ok(Ok(worker)) => worker,
-                Ok(Err(err)) => {
-                    workers.mark_failed();
-                    error!(
-                        "failed to initialize model worker worker_id={} error={}",
-                        worker_id, err
-                    );
+            loop {
+                let Some(mut worker) =
+                    initialize_worker(worker_id, Arc::clone(&config), &workers, &metrics).await
+                else {
                     return;
-                }
-                Err(err) => {
-                    workers.mark_failed();
-                    error!(
-                        "model worker initialization panicked worker_id={} error={}",
-                        worker_id, err
+                };
+
+                let mut restart_worker = false;
+                while let Ok(request) = queue_rx.recv().await {
+                    let job_span = tracing::info_span!(
+                        "inference_job",
+                        job_id = %request.id,
+                        worker_id,
+                        task_type = request.task.task_type_name(),
+                        task_prompt = request.task.task_prompt_name(),
                     );
-                    return;
-                }
-            };
-
-            workers.mark_ready();
-            info!("model worker ready worker_id={}", worker_id);
-            while let Ok(request) = queue_rx.recv().await {
-                debug!(
-                    "worker received job worker_id={} job_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
-                    worker_id,
-                    request.id,
-                    request.task.task_type_name(),
-                    request.task.task_prompt_name(),
-                    request.task.text_input.is_some(),
-                    request.image_path.display()
-                );
-                mark_running(&jobs, request.id).await;
-
-                let result = tokio::task::spawn_blocking({
-                    let image_path = request.image_path.clone();
-                    let task = request.task.clone();
-                    let worker_id = worker_id;
-                    // ORT inference is CPU/GPU-bound and may block. Move the
-                    // worker into a blocking task, then return it to this loop.
-                    let mut worker = worker.take_for_blocking();
-                    move || {
-                        let result = worker.infer(&image_path, &task);
-                        (worker_id, worker, result)
-                    }
-                })
-                .await;
-
-                match result {
-                    Ok((_, returned_worker, Ok(metadata))) => {
-                        worker = returned_worker;
-                        finish_job(&config, &jobs, request.id, Ok(metadata)).await;
-                    }
-                    Ok((_, returned_worker, Err(err))) => {
-                        worker = returned_worker;
-                        finish_job(&config, &jobs, request.id, Err(err)).await;
-                    }
-                    Err(err) => {
-                        finish_job(
-                            &config,
-                            &jobs,
+                    job_span.in_scope(|| {
+                        debug!(
+                            "worker received job worker_id={} job_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
+                            worker_id,
                             request.id,
-                            Err(anyhow!("worker task failed: {err}")),
-                        )
-                        .await;
-                        break;
+                            request.task.task_type_name(),
+                            request.task.task_prompt_name(),
+                            request.task.text_input.is_some(),
+                            request.image_path.display()
+                        );
+                    });
+                    metrics.record_job_started();
+                    let job_started = Instant::now();
+                    mark_running(&jobs, request.id).await;
+
+                    let join_handle = tokio::task::spawn_blocking({
+                        let image_path = request.image_path.clone();
+                        let task = request.task.clone();
+                        let mut worker = worker.take_for_blocking();
+                        let job_span = job_span.clone();
+                        move || {
+                            job_span.in_scope(|| {
+                                let result = worker.infer(&image_path, &task);
+                                (worker_id, worker, result)
+                            })
+                        }
+                    });
+
+                    let result = wait_for_inference(&config, join_handle).await;
+                    let elapsed_ms = job_started.elapsed().as_millis();
+
+                    match result {
+                        InferenceRunResult::Completed(result) => match *result {
+                            Ok((_, returned_worker, Ok(metadata))) => {
+                                worker = returned_worker;
+                                metrics.record_job_succeeded(elapsed_ms);
+                                finish_job(&config, &jobs, request.id, Ok(metadata)).await;
+                            }
+                            Ok((_, returned_worker, Err(err))) => {
+                                worker = returned_worker;
+                                metrics.record_job_failed(elapsed_ms);
+                                finish_job(&config, &jobs, request.id, Err(err)).await;
+                            }
+                            Err(err) => {
+                                metrics.record_job_failed(elapsed_ms);
+                                metrics.record_worker_restart();
+                                finish_job(
+                                    &config,
+                                    &jobs,
+                                    request.id,
+                                    Err(anyhow!("worker task failed: {err}")),
+                                )
+                                .await;
+                                restart_worker = true;
+                                break;
+                            }
+                        },
+                        InferenceRunResult::TimedOut => {
+                            metrics.record_job_timed_out(elapsed_ms);
+                            metrics.record_worker_restart();
+                            finish_job(
+                                &config,
+                                &jobs,
+                                request.id,
+                                Err(anyhow!(
+                                    "job timed out after {} seconds",
+                                    config.job_timeout_seconds
+                                )),
+                            )
+                            .await;
+                            restart_worker = true;
+                            break;
+                        }
                     }
+                }
+
+                workers.mark_stopped();
+                if !restart_worker {
+                    return;
                 }
             }
-            workers.mark_stopped();
         });
+    }
+}
+
+async fn initialize_worker(
+    worker_id: usize,
+    config: Arc<Config>,
+    workers: &WorkerPoolState,
+    metrics: &AppMetrics,
+) -> Option<FlorenceWorker> {
+    let started = Instant::now();
+    let worker = tokio::task::spawn_blocking({
+        let config = Arc::clone(&config);
+        move || FlorenceWorker::new(worker_id, config)
+    })
+    .await;
+
+    match worker {
+        Ok(Ok(worker)) => {
+            metrics.record_model_load(started.elapsed().as_millis());
+            workers.mark_ready();
+            info!("model worker ready worker_id={}", worker_id);
+            Some(worker)
+        }
+        Ok(Err(err)) => {
+            workers.mark_failed();
+            error!(
+                "failed to initialize model worker worker_id={} error={}",
+                worker_id, err
+            );
+            None
+        }
+        Err(err) => {
+            workers.mark_failed();
+            error!(
+                "model worker initialization panicked worker_id={} error={}",
+                worker_id, err
+            );
+            None
+        }
+    }
+}
+
+type BlockingInferenceJoin =
+    tokio::task::JoinHandle<(usize, FlorenceWorker, anyhow::Result<InferenceMetadata>)>;
+type BlockingInferenceResult =
+    Result<(usize, FlorenceWorker, anyhow::Result<InferenceMetadata>), tokio::task::JoinError>;
+
+enum InferenceRunResult {
+    Completed(Box<BlockingInferenceResult>),
+    TimedOut,
+}
+
+async fn wait_for_inference(
+    config: &Config,
+    join_handle: BlockingInferenceJoin,
+) -> InferenceRunResult {
+    if config.job_timeout_seconds == 0 {
+        return InferenceRunResult::Completed(Box::new(join_handle.await));
+    }
+
+    match tokio::time::timeout(Duration::from_secs(config.job_timeout_seconds), join_handle).await {
+        Ok(result) => InferenceRunResult::Completed(Box::new(result)),
+        Err(_) => InferenceRunResult::TimedOut,
     }
 }
 
@@ -334,6 +480,10 @@ async fn finish_job(
             );
         }
         cleanup_job_artifacts(config, &record).await;
+        {
+            let mut jobs = jobs.write().await;
+            retain_recent_jobs(&mut jobs, config.job_retention_limit);
+        }
     } else {
         warn!("job missing while finishing job_id={}", id);
     }
@@ -386,7 +536,10 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::{config::ModelVariant, state::WorkerPoolState};
+    use crate::{
+        config::ModelVariant,
+        state::{AppMetrics, WorkerPoolState},
+    };
 
     fn test_config() -> Config {
         Config {
@@ -401,11 +554,16 @@ mod tests {
             allow_local_paths: false,
             local_path_roots: Vec::new(),
             cors_allowed_origins: Vec::new(),
+            job_retention_limit: 1000,
+            metadata_retention_limit: 10_000,
+            max_image_width: 8192,
+            max_image_height: 8192,
             workers: 1,
             queue_size: 1,
             body_limit_bytes: 1024,
             rust_log: "info".to_string(),
             max_new_tokens: 1,
+            job_timeout_seconds: 300,
             execution_providers: vec!["cpu".to_string()],
         }
     }
@@ -498,6 +656,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_jobs_applies_retention_and_compacts_metadata() {
+        let mut config = temp_config("retention");
+        config.job_retention_limit = 2;
+        config.metadata_retention_limit = 2;
+
+        for minutes in 0..3 {
+            let mut record = job_record("upload", config.images_dir.join(format!("{minutes}.png")));
+            record.id = Uuid::new_v4();
+            record.status = JobStatus::Succeeded;
+            record.updated_at += time::Duration::minutes(minutes);
+            append_jsonl(&config.results_jsonl, &record).await.unwrap();
+        }
+
+        let jobs = load_jobs(&config).await.unwrap();
+        let compacted = std::fs::read_to_string(&config.results_jsonl).unwrap();
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(compacted.lines().count(), 2);
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn enqueue_record_rejects_full_queue_without_persisting() {
         let config = Arc::new(temp_config("queue-full"));
         let (queue_tx, queue_rx) = bounded(1);
@@ -513,6 +694,7 @@ mod tests {
             queue_tx,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(WorkerPoolState::new(1)),
+            metrics: Arc::new(AppMetrics::default()),
         };
         let record = job_record("upload", config.images_dir.join("job.png"));
         let err = enqueue_record(&state, record.clone()).await.unwrap_err();

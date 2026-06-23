@@ -14,6 +14,18 @@ curl http://127.0.0.1:3000/ready
 
 `/health` is a liveness endpoint. `/ready` returns `200` only after at least one model worker has initialized successfully; otherwise it returns `503`.
 
+Metrics snapshot:
+
+```bash
+curl http://127.0.0.1:3000/metrics
+```
+
+OpenAPI document:
+
+```bash
+curl http://127.0.0.1:3000/openapi.json
+```
+
 Upload image:
 
 ```bash
@@ -41,4 +53,15 @@ Check job:
 curl http://127.0.0.1:3000/v1/jobs/<job-id>
 ```
 
-Inference submissions return `503` when no model worker is ready, when the queue is full, or when the queue has closed.
+Errors use a stable JSON shape:
+
+```json
+{
+  "code": "bad_request",
+  "message": "uploaded image is empty"
+}
+```
+
+Known error codes are `bad_request`, `not_found`, `forbidden`, `service_unavailable`, and `internal_error`.
+
+Inference submissions return `503` when no model worker is ready, when the queue is full, or when the queue has closed. Uploads are rejected before inference if they exceed the configured body limit, have an unsupported content type or format, or exceed the configured image dimensions.

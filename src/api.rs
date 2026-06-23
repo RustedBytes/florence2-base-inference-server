@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Instant};
+use std::{io::Cursor, path::PathBuf, time::Instant};
 
 use anyhow::Context;
 use askama::Template;
@@ -11,8 +11,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use image::ImageReader;
 use log::{debug, info, trace, warn};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::fs;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -23,8 +25,9 @@ use crate::{
     state::AppState,
     templates::IndexTemplate,
     types::{
-        CASCADED_TASK_PROMPTS, HealthResponse, JobRecord, JobStatus, QueueResponse,
-        ReadinessResponse, SINGLE_TASK_PROMPTS, TaskSpec, WorkerHealth,
+        CASCADED_TASK_PROMPTS, ErrorResponse, HealthResponse, JobRecord, JobStatus,
+        MetricsResponse, QueueResponse, ReadinessResponse, SINGLE_TASK_PROMPTS, TaskSpec,
+        WorkerHealth,
     },
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
@@ -35,6 +38,8 @@ pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/metrics", get(metrics))
+        .route("/openapi.json", get(openapi))
         .route("/v1/infer", post(submit_inference))
         .route("/infer-form", post(submit_inference_form))
         .route("/v1/infer/path", post(submit_inference_path))
@@ -48,11 +53,6 @@ pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
     } else {
         router.layer(cors_layer(&cors_allowed_origins))
     }
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,17 +71,30 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self {
+        let status = match &self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = Json(ErrorBody {
-            error: self.to_string(),
+        let body = Json(ErrorResponse {
+            code: self.code().to_string(),
+            message: self.to_string(),
         });
         (status, body).into_response()
+    }
+}
+
+impl ApiError {
+    fn code(&self) -> &'static str {
+        match self {
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::NotFound => "not_found",
+            ApiError::Forbidden(_) => "forbidden",
+            ApiError::ServiceUnavailable(_) => "service_unavailable",
+            ApiError::Internal(_) => "internal_error",
+        }
     }
 }
 
@@ -143,6 +156,32 @@ async fn readiness(State(state): State<AppState>) -> Response {
     };
 
     (status, Json(response)).into_response()
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
+    let workers = worker_health(&state);
+    let metrics = state.metrics.snapshot();
+    let completed = metrics.jobs_succeeded + metrics.jobs_failed;
+    let average_inference_ms =
+        (completed > 0).then_some(metrics.total_inference_ms as f64 / completed as f64);
+
+    Json(MetricsResponse {
+        workers,
+        queued: state.queue_tx.len(),
+        jobs_started: metrics.jobs_started,
+        jobs_succeeded: metrics.jobs_succeeded,
+        jobs_failed: metrics.jobs_failed,
+        jobs_timed_out: metrics.jobs_timed_out,
+        worker_restarts: metrics.worker_restarts,
+        total_inference_ms: metrics.total_inference_ms as u128,
+        average_inference_ms,
+        model_load_ms: metrics.model_load_ms.map(|value| value as u128),
+        retained_jobs: state.jobs.read().await.len(),
+    })
+}
+
+async fn openapi() -> Json<Value> {
+    Json(openapi_document())
 }
 
 async fn submit_inference(
@@ -226,6 +265,7 @@ async fn submit_multipart_job(
         warn!("rejecting empty image upload");
         return Err(ApiError::BadRequest("uploaded image is empty".into()));
     }
+    validate_image_bytes(state, image.content_type.as_deref(), &image.bytes)?;
 
     let id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
@@ -309,6 +349,11 @@ async fn submit_inference_path(
         warn!("rejecting empty local image path={}", image_path.display());
         return Err(ApiError::BadRequest("local image file is empty".into()));
     }
+    let content_type = image::guess_format(&bytes)
+        .ok()
+        .and_then(image_format_content_type)
+        .map(str::to_string);
+    validate_image_bytes(&state, content_type.as_deref(), &bytes)?;
 
     let id = Uuid::new_v4();
     let task = task_spec_from_request(
@@ -320,10 +365,6 @@ async fn submit_inference_path(
     let filename = image_path
         .file_name()
         .map(|filename| filename.to_string_lossy().into_owned());
-    let content_type = image::guess_format(&bytes)
-        .ok()
-        .and_then(image_format_content_type)
-        .map(str::to_string);
     let image_sha256 = sha256_hex(&bytes);
 
     debug!(
@@ -483,6 +524,44 @@ async fn ensure_local_path_allowed(
     )))
 }
 
+fn validate_image_bytes(
+    state: &AppState,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Result<(), ApiError> {
+    if let Some(content_type) = content_type
+        && !content_type.starts_with("image/")
+    {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported content type `{content_type}`; expected an image"
+        )));
+    }
+
+    let format = image::guess_format(bytes)
+        .map_err(|_| ApiError::BadRequest("unsupported or invalid image format".to_string()))?;
+    if image_format_content_type(format).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported image format: {format:?}"
+        )));
+    }
+
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| ApiError::BadRequest(format!("failed to identify image format: {err}")))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|err| ApiError::BadRequest(format!("failed to read image dimensions: {err}")))?;
+
+    if width > state.config.max_image_width || height > state.config.max_image_height {
+        return Err(ApiError::BadRequest(format!(
+            "image dimensions {}x{} exceed configured limit {}x{}",
+            width, height, state.config.max_image_width, state.config.max_image_height
+        )));
+    }
+
+    Ok(())
+}
+
 fn worker_health(state: &AppState) -> WorkerHealth {
     let snapshot = state.workers.snapshot();
     WorkerHealth {
@@ -490,6 +569,153 @@ fn worker_health(state: &AppState) -> WorkerHealth {
         ready: snapshot.ready,
         failed: snapshot.failed,
     }
+}
+
+fn openapi_document() -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Florence-2 Base Inference Server",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Liveness check",
+                    "responses": {
+                        "200": {
+                            "description": "Process is alive",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
+                        }
+                    }
+                }
+            },
+            "/ready": {
+                "get": {
+                    "summary": "Readiness check",
+                    "responses": {
+                        "200": { "description": "At least one worker is ready" },
+                        "503": { "description": "No model worker is ready" }
+                    }
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "summary": "Runtime metrics snapshot",
+                    "responses": {
+                        "200": {
+                            "description": "Metrics snapshot",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetricsResponse" } } }
+                        }
+                    }
+                }
+            },
+            "/v1/infer": {
+                "post": {
+                    "summary": "Queue inference from a multipart image upload",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/UploadInferenceRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+                    }
+                }
+            },
+            "/v1/infer/path": {
+                "post": {
+                    "summary": "Queue inference from a server-side image path",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalPathRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
+                        "400": { "$ref": "#/components/responses/BadRequest" },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+                    }
+                }
+            },
+            "/v1/jobs/{id}": {
+                "get": {
+                    "summary": "Fetch a job record",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string", "format": "uuid" }
+                    }],
+                    "responses": {
+                        "200": { "description": "Job record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobRecord" } } } },
+                        "404": { "$ref": "#/components/responses/NotFound" }
+                    }
+                }
+            }
+        },
+        "components": {
+            "responses": {
+                "BadRequest": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "Forbidden": { "description": "Forbidden", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "NotFound": { "description": "Not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "ServiceUnavailable": { "description": "Service unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+            },
+            "schemas": {
+                "ErrorResponse": {
+                    "type": "object",
+                    "required": ["code", "message"],
+                    "properties": {
+                        "code": { "type": "string" },
+                        "message": { "type": "string" }
+                    }
+                },
+                "QueueResponse": {
+                    "type": "object",
+                    "required": ["id", "status", "status_url"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "status": { "type": "string" },
+                        "status_url": { "type": "string" }
+                    }
+                },
+                "LocalPathRequest": {
+                    "type": "object",
+                    "required": ["image_path"],
+                    "properties": {
+                        "image_path": { "type": "string" },
+                        "task_type": { "type": "string" },
+                        "task_prompt": { "type": "string" },
+                        "text_input": { "type": ["string", "null"] },
+                        "task": { "type": "string", "deprecated": true }
+                    }
+                },
+                "UploadInferenceRequest": {
+                    "type": "object",
+                    "required": ["image"],
+                    "properties": {
+                        "image": { "type": "string", "format": "binary" },
+                        "task_type": { "type": "string" },
+                        "task_prompt": { "type": "string" },
+                        "text_input": { "type": "string" }
+                    }
+                },
+                "WorkerHealth": {
+                    "type": "object",
+                    "required": ["expected", "ready", "failed"],
+                    "properties": {
+                        "expected": { "type": "integer" },
+                        "ready": { "type": "integer" },
+                        "failed": { "type": "integer" }
+                    }
+                },
+                "HealthResponse": { "type": "object" },
+                "MetricsResponse": { "type": "object" },
+                "JobRecord": { "type": "object" }
+            }
+        }
+    })
 }
 
 fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
@@ -520,7 +746,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, ModelVariant},
-        state::WorkerPoolState,
+        state::{AppMetrics, WorkerPoolState},
         types::{TaskPrompt, TaskType},
     };
 
@@ -589,6 +815,55 @@ mod tests {
         assert!(html.contains("bad request"));
     }
 
+    #[test]
+    fn api_errors_have_stable_codes() {
+        assert_eq!(ApiError::NotFound.code(), "not_found");
+        assert_eq!(
+            ApiError::ServiceUnavailable("not ready".to_string()).code(),
+            "service_unavailable"
+        );
+    }
+
+    #[test]
+    fn openapi_document_describes_core_paths() {
+        let document = openapi_document();
+
+        assert_eq!(document["openapi"], "3.1.0");
+        assert!(document["paths"]["/v1/infer"].is_object());
+        assert!(document["paths"]["/metrics"].is_object());
+        assert!(document["components"]["schemas"]["ErrorResponse"].is_object());
+    }
+
+    #[test]
+    fn validates_supported_image_bytes() {
+        let state = test_state(false, Vec::new());
+
+        validate_image_bytes(&state, Some("image/png"), ONE_BY_ONE_PNG).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_image_content_type() {
+        let state = test_state(false, Vec::new());
+        let err = validate_image_bytes(&state, Some("text/plain"), ONE_BY_ONE_PNG).unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(err.to_string().contains("unsupported content type"));
+    }
+
+    #[tokio::test]
+    async fn metrics_response_reports_counters() {
+        let state = test_state(false, Vec::new());
+        state.metrics.record_job_started();
+        state.metrics.record_job_succeeded(42);
+
+        let Json(response) = metrics(State(state)).await;
+
+        assert_eq!(response.jobs_started, 1);
+        assert_eq!(response.jobs_succeeded, 1);
+        assert_eq!(response.total_inference_ms, 42);
+        assert_eq!(response.average_inference_ms, Some(42.0));
+    }
+
     #[tokio::test]
     async fn local_path_endpoint_is_disabled_by_default() {
         let state = test_state(false, Vec::new());
@@ -635,16 +910,28 @@ mod tests {
                 allow_local_paths,
                 local_path_roots,
                 cors_allowed_origins: Vec::new(),
+                job_retention_limit: 1000,
+                metadata_retention_limit: 10_000,
+                max_image_width: 8192,
+                max_image_height: 8192,
                 workers: 1,
                 queue_size: 1,
                 body_limit_bytes: 1024,
                 rust_log: "info".to_string(),
                 max_new_tokens: 1,
+                job_timeout_seconds: 300,
                 execution_providers: vec!["cpu".to_string()],
             }),
             queue_tx,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(WorkerPoolState::new(1)),
+            metrics: Arc::new(AppMetrics::default()),
         }
     }
+
+    const ONE_BY_ONE_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
+        13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
 }

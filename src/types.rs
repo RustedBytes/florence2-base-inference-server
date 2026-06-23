@@ -337,6 +337,12 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadinessResponse {
     pub status: &'static str,
     pub ready: bool,
@@ -349,6 +355,21 @@ pub struct WorkerHealth {
     pub expected: usize,
     pub ready: usize,
     pub failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub workers: WorkerHealth,
+    pub queued: usize,
+    pub jobs_started: usize,
+    pub jobs_succeeded: usize,
+    pub jobs_failed: usize,
+    pub jobs_timed_out: usize,
+    pub worker_restarts: usize,
+    pub total_inference_ms: u128,
+    pub average_inference_ms: Option<f64>,
+    pub model_load_ms: Option<u128>,
+    pub retained_jobs: usize,
 }
 
 #[cfg(test)]

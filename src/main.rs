@@ -11,10 +11,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
-use env_logger::Env;
 use log::{debug, info};
-use state::{AppState, WorkerPoolState};
+use state::{AppMetrics, AppState, WorkerPoolState};
 use tokio::sync::RwLock;
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::Config,
@@ -35,9 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Arc::new(Config::load(cli.config)?);
 
-    env_logger::Builder::from_env(Env::default().default_filter_or(&config.rust_log))
-        .format_timestamp_millis()
-        .init();
+    init_tracing(&config.rust_log)?;
 
     config.ensure_dirs().await?;
     validate_model_artifacts(&config.model_path, config.model_variant)?;
@@ -60,17 +58,20 @@ async fn main() -> anyhow::Result<()> {
     let (queue_tx, queue_rx) = async_channel::bounded(config.queue_size);
     let jobs = load_jobs(&config).await?;
     let workers = Arc::new(WorkerPoolState::new(config.workers));
+    let metrics = Arc::new(AppMetrics::default());
     let state = AppState {
         config: Arc::clone(&config),
         queue_tx,
         jobs: Arc::new(RwLock::new(jobs)),
         workers: Arc::clone(&workers),
+        metrics: Arc::clone(&metrics),
     };
 
     start_workers(
         Arc::clone(&config),
         Arc::clone(&state.jobs),
         workers,
+        metrics,
         queue_rx,
     );
 
@@ -103,4 +104,15 @@ async fn shutdown_signal() {
     if let Err(err) = tokio::signal::ctrl_c().await {
         log::error!("failed to install ctrl-c handler error={}", err);
     }
+}
+
+fn init_tracing(rust_log: &str) -> anyhow::Result<()> {
+    let _ = tracing_log::LogTracer::init();
+    let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(rust_log))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .compact()
+        .init();
+    Ok(())
 }

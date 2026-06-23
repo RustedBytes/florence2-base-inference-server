@@ -14,6 +14,11 @@ const DEFAULT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUST_LOG: &str = "info,ort=warn";
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_EXECUTION_PROVIDER: &str = "auto";
+const DEFAULT_JOB_RETENTION_LIMIT: usize = 1_000;
+const DEFAULT_METADATA_RETENTION_LIMIT: usize = 10_000;
+const DEFAULT_MAX_IMAGE_WIDTH: u32 = 8192;
+const DEFAULT_MAX_IMAGE_HEIGHT: u32 = 8192;
+const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 300;
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -27,11 +32,16 @@ pub struct Config {
     pub allow_local_paths: bool,
     pub local_path_roots: Vec<PathBuf>,
     pub cors_allowed_origins: Vec<String>,
+    pub job_retention_limit: usize,
+    pub metadata_retention_limit: usize,
+    pub max_image_width: u32,
+    pub max_image_height: u32,
     pub workers: usize,
     pub queue_size: usize,
     pub body_limit_bytes: usize,
     pub rust_log: String,
     pub max_new_tokens: usize,
+    pub job_timeout_seconds: u64,
     pub execution_providers: Vec<String>,
 }
 
@@ -44,6 +54,8 @@ impl Config {
         let generation = file_config.generation.unwrap_or_default();
         let runtime = file_config.runtime.unwrap_or_default();
         let logging = file_config.logging.unwrap_or_default();
+        let retention = file_config.retention.unwrap_or_default();
+        let validation = file_config.validation.unwrap_or_default();
 
         let data_dir = path_setting("DATA_DIR", server.data_dir, DEFAULT_DATA_DIR);
         let metadata_dir = data_dir.join("metadata");
@@ -73,6 +85,26 @@ impl Config {
             allow_local_paths,
             local_path_roots,
             cors_allowed_origins,
+            job_retention_limit: usize_setting(
+                "JOB_RETENTION_LIMIT",
+                retention.job_retention_limit,
+                DEFAULT_JOB_RETENTION_LIMIT,
+            )?,
+            metadata_retention_limit: usize_setting(
+                "METADATA_RETENTION_LIMIT",
+                retention.metadata_retention_limit,
+                DEFAULT_METADATA_RETENTION_LIMIT,
+            )?,
+            max_image_width: u32_setting(
+                "MAX_IMAGE_WIDTH",
+                validation.max_image_width,
+                DEFAULT_MAX_IMAGE_WIDTH,
+            )?,
+            max_image_height: u32_setting(
+                "MAX_IMAGE_HEIGHT",
+                validation.max_image_height,
+                DEFAULT_MAX_IMAGE_HEIGHT,
+            )?,
             metadata_dir,
             data_dir,
             workers: usize_setting(
@@ -94,6 +126,11 @@ impl Config {
                 DEFAULT_MAX_NEW_TOKENS,
             )?
             .max(1),
+            job_timeout_seconds: u64_setting(
+                "JOB_TIMEOUT_SECONDS",
+                generation.job_timeout_seconds,
+                DEFAULT_JOB_TIMEOUT_SECONDS,
+            )?,
             execution_providers: execution_providers_setting(runtime.execution_providers),
         })
     }
@@ -125,6 +162,8 @@ struct FileConfig {
     generation: Option<GenerationConfig>,
     runtime: Option<RuntimeConfig>,
     logging: Option<LoggingConfig>,
+    retention: Option<RetentionConfig>,
+    validation: Option<ValidationConfig>,
 }
 
 impl FileConfig {
@@ -181,6 +220,7 @@ struct QueueConfig {
 #[derive(Debug, Default, Deserialize)]
 struct GenerationConfig {
     max_new_tokens: Option<usize>,
+    job_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -191,6 +231,18 @@ struct RuntimeConfig {
 #[derive(Debug, Default, Deserialize)]
 struct LoggingConfig {
     rust_log: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RetentionConfig {
+    job_retention_limit: Option<usize>,
+    metadata_retention_limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ValidationConfig {
+    max_image_width: Option<u32>,
+    max_image_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -260,6 +312,24 @@ fn string_setting(key: &str, file_value: Option<String>, default: &str) -> Strin
 }
 
 fn usize_setting(key: &str, file_value: Option<usize>, default: usize) -> anyhow::Result<usize> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse()
+            .map_err(|err| anyhow!("{key} has invalid value `{value}`: {err}")),
+        Err(_) => Ok(file_value.unwrap_or(default)),
+    }
+}
+
+fn u64_setting(key: &str, file_value: Option<u64>, default: u64) -> anyhow::Result<u64> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse()
+            .map_err(|err| anyhow!("{key} has invalid value `{value}`: {err}")),
+        Err(_) => Ok(file_value.unwrap_or(default)),
+    }
+}
+
+fn u32_setting(key: &str, file_value: Option<u32>, default: u32) -> anyhow::Result<u32> {
     match env::var(key) {
         Ok(value) => value
             .parse()
@@ -488,8 +558,17 @@ model_pool_size = 2
 queue_size = 8
 body_limit_bytes = 4096
 
+[retention]
+job_retention_limit = 64
+metadata_retention_limit = 128
+
+[validation]
+max_image_width = 640
+max_image_height = 480
+
 [generation]
 max_new_tokens = 32
+job_timeout_seconds = 45
 
 [runtime]
 execution_providers = ["coreml-gpu", "xnnpack"]
@@ -506,6 +585,8 @@ rust_log = "debug"
         let server = config.server.unwrap();
         let model = config.model.unwrap();
         let queue = config.queue.unwrap();
+        let retention = config.retention.unwrap();
+        let validation = config.validation.unwrap();
         let generation = config.generation.unwrap();
         let runtime = config.runtime.unwrap();
         let logging = config.logging.unwrap();
@@ -516,7 +597,12 @@ rust_log = "debug"
         assert_eq!(queue.model_pool_size, Some(2));
         assert_eq!(queue.queue_size, Some(8));
         assert_eq!(queue.body_limit_bytes, Some(4096));
+        assert_eq!(retention.job_retention_limit, Some(64));
+        assert_eq!(retention.metadata_retention_limit, Some(128));
+        assert_eq!(validation.max_image_width, Some(640));
+        assert_eq!(validation.max_image_height, Some(480));
         assert_eq!(generation.max_new_tokens, Some(32));
+        assert_eq!(generation.job_timeout_seconds, Some(45));
         assert_eq!(
             runtime.execution_providers,
             Some(vec!["coreml-gpu".to_string(), "xnnpack".to_string()])
