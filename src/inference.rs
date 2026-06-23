@@ -29,6 +29,7 @@ const IMAGE_SIDE: u32 = 768;
 const HIDDEN_SIZE: i64 = 768;
 const DECODER_START_TOKEN_ID: i64 = 2;
 const EOS_TOKEN_ID: i64 = 2;
+const MAX_LOCATION_TOKEN: u16 = 999;
 
 pub fn validate_model_artifacts(model_path: &Path, variant: ModelVariant) -> anyhow::Result<()> {
     FlorenceModelPaths::from_vision_path(model_path, variant).ensure_exists()
@@ -671,36 +672,43 @@ fn load_session(path: &Path, execution_providers: &[String]) -> anyhow::Result<S
 fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<ExecutionProviderDispatch> {
     execution_providers
         .iter()
-        .filter_map(|provider| match provider.as_str() {
-            "coreml" => Some(
-                ep::CoreML::default()
-                    .with_compute_units(ep::coreml::ComputeUnits::All)
-                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
-                    .with_low_precision_accumulation_on_gpu(true)
-                    .build(),
-            ),
-            "coremlgpu" => Some(
-                ep::CoreML::default()
-                    .with_compute_units(ep::coreml::ComputeUnits::CPUAndGPU)
-                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
-                    .with_low_precision_accumulation_on_gpu(true)
-                    .build(),
-            ),
-            "coremlnpu" | "coremlane" | "ane" | "npu" => Some(
-                ep::CoreML::default()
-                    .with_compute_units(ep::coreml::ComputeUnits::CPUAndNeuralEngine)
-                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
-                    .build(),
-            ),
-            "cuda" => cuda_execution_provider(),
-            "xnnpack" => Some(ep::XNNPACK::default().build()),
-            "auto" | "autodevice" | "cpu" => None,
-            other => {
-                warn!("unknown execution provider `{other}` ignored");
-                None
-            }
-        })
+        .filter_map(|provider| execution_provider_dispatch(provider))
         .collect()
+}
+
+fn execution_provider_dispatch(provider: &str) -> Option<ExecutionProviderDispatch> {
+    match provider {
+        "coreml" => Some(coreml_execution_provider(
+            ep::coreml::ComputeUnits::All,
+            true,
+        )),
+        "coremlgpu" => Some(coreml_execution_provider(
+            ep::coreml::ComputeUnits::CPUAndGPU,
+            true,
+        )),
+        "coremlnpu" | "coremlane" | "ane" | "npu" => Some(coreml_execution_provider(
+            ep::coreml::ComputeUnits::CPUAndNeuralEngine,
+            false,
+        )),
+        "cuda" => cuda_execution_provider(),
+        "xnnpack" => Some(ep::XNNPACK::default().build()),
+        "auto" | "autodevice" | "cpu" => None,
+        other => {
+            warn!("unknown execution provider `{other}` ignored");
+            None
+        }
+    }
+}
+
+fn coreml_execution_provider(
+    compute_units: ep::coreml::ComputeUnits,
+    low_precision_accumulation_on_gpu: bool,
+) -> ExecutionProviderDispatch {
+    ep::CoreML::default()
+        .with_compute_units(compute_units)
+        .with_model_format(ep::coreml::ModelFormat::MLProgram)
+        .with_low_precision_accumulation_on_gpu(low_precision_accumulation_on_gpu)
+        .build()
 }
 
 #[cfg(feature = "cuda")]
@@ -997,7 +1005,10 @@ fn parse_loc_token_at(input: &str, cursor: usize) -> Option<(u16, usize)> {
     let remaining = remaining.strip_prefix("<loc_")?;
     let end = remaining.find('>')?;
     let loc = remaining[..end].parse::<u16>().ok()?;
-    Some((loc.min(999), cursor + "<loc_".len() + end + 1))
+    Some((
+        loc.min(MAX_LOCATION_TOKEN),
+        cursor + "<loc_".len() + end + 1,
+    ))
 }
 
 fn ocr_region_item(text: String, loc_tokens: Vec<u16>, image_size: (u32, u32)) -> Option<Value> {

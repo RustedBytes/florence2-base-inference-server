@@ -11,7 +11,7 @@ use askama::Template;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Request, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Request, State, multipart::Field},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -20,7 +20,7 @@ use axum::{
 use image::ImageReader;
 use log::{debug, info, trace, warn};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::fs;
 use tower_http::{
@@ -41,6 +41,8 @@ use crate::{
     },
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
+
+const GPU_MEMORY_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub fn router(state: AppState) -> Router {
     let cors_allowed_origins = state.config.cors_allowed_origins.clone();
@@ -145,6 +147,15 @@ struct UploadedImage {
     filename: Option<String>,
     content_type: Option<String>,
     bytes: Bytes,
+}
+
+#[derive(Default)]
+struct MultipartInferenceRequest {
+    image: Option<UploadedImage>,
+    task_type: Option<String>,
+    task_prompt: Option<String>,
+    text_input: Option<String>,
+    webhook_url: Option<String>,
 }
 
 async fn index() -> Result<Html<String>, ApiError> {
@@ -252,13 +263,16 @@ async fn submit_multipart_job(
 ) -> Result<QueueResponse, ApiError> {
     debug!("multipart inference submission started");
     ensure_workers_ready(state)?;
+    let request = read_multipart_inference_request(&mut multipart).await?;
+    let record = uploaded_job_record(state, request).await?;
 
-    let mut image: Option<UploadedImage> = None;
-    let mut task_type: Option<String> = None;
-    let mut task_prompt: Option<String> = None;
-    let mut text_input: Option<String> = None;
-    let mut webhook_url: Option<String> = None;
+    enqueue_record(state, record).await.map_err(ApiError::from)
+}
 
+async fn read_multipart_inference_request(
+    multipart: &mut Multipart,
+) -> Result<MultipartInferenceRequest, ApiError> {
+    let mut request = MultipartInferenceRequest::default();
     while let Some(field) = multipart
         .next_field()
         .await
@@ -266,53 +280,74 @@ async fn submit_multipart_job(
     {
         let name = field.name().unwrap_or_default().to_string();
         trace!("multipart field received name={}", name);
-        match name.as_str() {
-            "image" | "file" => {
-                let filename = field.file_name().map(str::to_string);
-                let content_type = field.content_type().map(str::to_string);
-                let bytes = field.bytes().await.map_err(|err| {
-                    ApiError::BadRequest(format!("failed to read image field: {err}"))
-                })?;
-                debug!(
-                    "image field read filename={:?} content_type={:?} bytes={}",
-                    filename,
-                    content_type,
-                    bytes.len()
-                );
-                image = Some(UploadedImage {
-                    filename,
-                    content_type,
-                    bytes,
-                });
-            }
-            "task_type" | "task_type_selector" => {
-                task_type = Some(field.text().await.map_err(|err| {
-                    ApiError::BadRequest(format!("failed to read task_type field: {err}"))
-                })?);
-            }
-            "task_prompt" | "task" => {
-                task_prompt = Some(field.text().await.map_err(|err| {
-                    ApiError::BadRequest(format!("failed to read task field: {err}"))
-                })?);
-            }
-            "text_input" => {
-                text_input = Some(field.text().await.map_err(|err| {
-                    ApiError::BadRequest(format!("failed to read text_input field: {err}"))
-                })?);
-            }
-            "webhook_url" => {
-                webhook_url = Some(field.text().await.map_err(|err| {
-                    ApiError::BadRequest(format!("failed to read webhook_url field: {err}"))
-                })?);
-            }
-            _ => {}
-        }
+        apply_multipart_field(&mut request, name.as_str(), field).await?;
     }
-    let task = task_spec_from_request(task_type, task_prompt, text_input, None)?;
-    let webhook_url = validate_webhook_url(&state.config, webhook_url)?;
 
-    let image =
-        image.ok_or_else(|| ApiError::BadRequest("multipart field `image` is required".into()))?;
+    Ok(request)
+}
+
+async fn apply_multipart_field(
+    request: &mut MultipartInferenceRequest,
+    name: &str,
+    field: Field<'_>,
+) -> Result<(), ApiError> {
+    match name {
+        "image" | "file" => request.image = Some(read_uploaded_image(field).await?),
+        "task_type" | "task_type_selector" => {
+            request.task_type = Some(read_text_field(field, "task_type").await?);
+        }
+        "task_prompt" | "task" => {
+            request.task_prompt = Some(read_text_field(field, "task").await?);
+        }
+        "text_input" => request.text_input = Some(read_text_field(field, "text_input").await?),
+        "webhook_url" => request.webhook_url = Some(read_text_field(field, "webhook_url").await?),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn read_uploaded_image(field: Field<'_>) -> Result<UploadedImage, ApiError> {
+    let filename = field.file_name().map(str::to_string);
+    let content_type = field.content_type().map(str::to_string);
+    let bytes = field
+        .bytes()
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("failed to read image field: {err}")))?;
+    debug!(
+        "image field read filename={:?} content_type={:?} bytes={}",
+        filename,
+        content_type,
+        bytes.len()
+    );
+    Ok(UploadedImage {
+        filename,
+        content_type,
+        bytes,
+    })
+}
+
+async fn read_text_field(field: Field<'_>, field_name: &str) -> Result<String, ApiError> {
+    field
+        .text()
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("failed to read {field_name} field: {err}")))
+}
+
+async fn uploaded_job_record(
+    state: &AppState,
+    request: MultipartInferenceRequest,
+) -> Result<JobRecord, ApiError> {
+    let task = task_spec_from_request(
+        request.task_type,
+        request.task_prompt,
+        request.text_input,
+        None,
+    )?;
+    let webhook_url = validate_webhook_url(&state.config, request.webhook_url)?;
+    let image = request
+        .image
+        .ok_or_else(|| ApiError::BadRequest("multipart field `image` is required".into()))?;
     if image.bytes.is_empty() {
         warn!("rejecting empty image upload");
         return Err(ApiError::BadRequest("uploaded image is empty".into()));
@@ -321,21 +356,9 @@ async fn submit_multipart_job(
 
     let id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
-    let extension = guess_extension(image.content_type.as_deref(), &image.bytes);
-    let image_path = state.config.images_dir.join(format!("{id}.{extension}"));
-    fs::write(&image_path, &image.bytes)
-        .await
-        .with_context(|| format!("failed to save uploaded image to {}", image_path.display()))?;
-    debug!(
-        "uploaded image saved job_id={} path={} bytes={} extension={}",
-        id,
-        image_path.display(),
-        image.bytes.len(),
-        extension
-    );
-
+    let image_path = save_uploaded_image(&state.config, id, &image).await?;
     let image_sha256 = sha256_hex(&image.bytes);
-    let record = JobRecord {
+    Ok(JobRecord {
         id,
         status: JobStatus::Queued,
         created_at: now,
@@ -353,9 +376,27 @@ async fn submit_multipart_job(
         webhook_url,
         result: None,
         error: None,
-    };
+    })
+}
 
-    enqueue_record(state, record).await.map_err(ApiError::from)
+async fn save_uploaded_image(
+    config: &Config,
+    id: Uuid,
+    image: &UploadedImage,
+) -> Result<PathBuf, ApiError> {
+    let extension = guess_extension(image.content_type.as_deref(), &image.bytes);
+    let image_path = config.images_dir.join(format!("{id}.{extension}"));
+    fs::write(&image_path, &image.bytes)
+        .await
+        .with_context(|| format!("failed to save uploaded image to {}", image_path.display()))?;
+    debug!(
+        "uploaded image saved job_id={} path={} bytes={} extension={}",
+        id,
+        image_path.display(),
+        image.bytes.len(),
+        extension
+    );
+    Ok(image_path)
 }
 
 async fn submit_inference_path(
@@ -368,45 +409,22 @@ async fn submit_inference_path(
         request.image_path.display()
     );
 
-    if request.image_path.as_os_str().is_empty() {
-        return Err(ApiError::BadRequest("`image_path` is required".into()));
-    }
+    let record = local_path_job_record(&state, request).await?;
 
-    let image_path = fs::canonicalize(&request.image_path).await.map_err(|err| {
-        ApiError::BadRequest(format!(
-            "failed to resolve image path {}: {err}",
-            request.image_path.display()
-        ))
-    })?;
-    ensure_local_path_allowed(&state, &image_path).await?;
-    let metadata = fs::metadata(&image_path).await.map_err(|err| {
-        ApiError::BadRequest(format!(
-            "failed to inspect image path {}: {err}",
-            image_path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(ApiError::BadRequest(format!(
-            "image path is not a regular file: {}",
-            image_path.display()
-        )));
-    }
+    Ok(Json(enqueue_record(&state, record).await?))
+}
 
-    let bytes = fs::read(&image_path).await.map_err(|err| {
-        ApiError::BadRequest(format!(
-            "failed to read image path {}: {err}",
-            image_path.display()
-        ))
-    })?;
-    if bytes.is_empty() {
-        warn!("rejecting empty local image path={}", image_path.display());
-        return Err(ApiError::BadRequest("local image file is empty".into()));
-    }
+async fn local_path_job_record(
+    state: &AppState,
+    request: LocalPathRequest,
+) -> Result<JobRecord, ApiError> {
+    let image_path = validated_local_image_path(state, &request.image_path).await?;
+    let bytes = read_local_image(&image_path).await?;
     let content_type = image::guess_format(&bytes)
         .ok()
         .and_then(image_format_content_type)
         .map(str::to_string);
-    validate_image_bytes(&state, content_type.as_deref(), &bytes)?;
+    validate_image_bytes(state, content_type.as_deref(), &bytes)?;
 
     let id = Uuid::new_v4();
     let task = task_spec_from_request(
@@ -419,7 +437,6 @@ async fn submit_inference_path(
     let filename = image_path
         .file_name()
         .map(|filename| filename.to_string_lossy().into_owned());
-    let image_sha256 = sha256_hex(&bytes);
 
     debug!(
         "local image accepted job_id={} path={} bytes={} content_type={:?}",
@@ -429,15 +446,16 @@ async fn submit_inference_path(
         content_type
     );
 
-    let record = JobRecord {
+    let now = OffsetDateTime::now_utc();
+    Ok(JobRecord {
         id,
         status: JobStatus::Queued,
-        created_at: OffsetDateTime::now_utc(),
-        updated_at: OffsetDateTime::now_utc(),
+        created_at: now,
+        updated_at: now,
         image_path: image_path.clone(),
         filename,
         content_type,
-        image_sha256,
+        image_sha256: sha256_hex(&bytes),
         image_bytes: bytes.len(),
         input_kind: "local_path".to_string(),
         source_path: Some(image_path),
@@ -447,9 +465,51 @@ async fn submit_inference_path(
         webhook_url,
         result: None,
         error: None,
-    };
+    })
+}
 
-    Ok(Json(enqueue_record(&state, record).await?))
+async fn validated_local_image_path(
+    state: &AppState,
+    requested_path: &PathBuf,
+) -> Result<PathBuf, ApiError> {
+    if requested_path.as_os_str().is_empty() {
+        return Err(ApiError::BadRequest("`image_path` is required".into()));
+    }
+
+    let image_path = fs::canonicalize(requested_path).await.map_err(|err| {
+        ApiError::BadRequest(format!(
+            "failed to resolve image path {}: {err}",
+            requested_path.display()
+        ))
+    })?;
+    ensure_local_path_allowed(state, &image_path).await?;
+    let metadata = fs::metadata(&image_path).await.map_err(|err| {
+        ApiError::BadRequest(format!(
+            "failed to inspect image path {}: {err}",
+            image_path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::BadRequest(format!(
+            "image path is not a regular file: {}",
+            image_path.display()
+        )));
+    }
+    Ok(image_path)
+}
+
+async fn read_local_image(image_path: &PathBuf) -> Result<Vec<u8>, ApiError> {
+    let bytes = fs::read(image_path).await.map_err(|err| {
+        ApiError::BadRequest(format!(
+            "failed to read image path {}: {err}",
+            image_path.display()
+        ))
+    })?;
+    if bytes.is_empty() {
+        warn!("rejecting empty local image path={}", image_path.display());
+        return Err(ApiError::BadRequest("local image file is empty".into()));
+    }
+    Ok(bytes)
 }
 
 impl From<EnqueueError> for ApiError {
@@ -666,7 +726,7 @@ fn process_memory_rss_bytes() -> Option<u64> {
 
 async fn gpu_memory_usage() -> Option<GpuMemoryResponse> {
     let output = tokio::time::timeout(
-        Duration::from_millis(500),
+        GPU_MEMORY_QUERY_TIMEOUT,
         tokio::process::Command::new("nvidia-smi")
             .args([
                 "--query-gpu=memory.used,memory.total",
@@ -761,14 +821,8 @@ fn validate_public_webhook_host(url: &reqwest::Url) -> Result<(), ApiError> {
     };
 
     if let Ok(ip) = host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(ip) if ipv4_is_private_or_local(ip) => {
-                return Err(private_webhook_url_error());
-            }
-            IpAddr::V6(ip) if ipv6_is_private_or_local(ip) => {
-                return Err(private_webhook_url_error());
-            }
-            IpAddr::V4(_) | IpAddr::V6(_) => {}
+        if ip_is_private_or_local(ip) {
+            return Err(private_webhook_url_error());
         }
     } else {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -778,6 +832,13 @@ fn validate_public_webhook_host(url: &reqwest::Url) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+fn ip_is_private_or_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_is_private_or_local(ip),
+        IpAddr::V6(ip) => ipv6_is_private_or_local(ip),
+    }
 }
 
 fn private_webhook_url_error() -> ApiError {
@@ -916,179 +977,10 @@ fn worker_health(state: &AppState) -> WorkerHealth {
 }
 
 fn openapi_document() -> Value {
-    json!({
-        "openapi": "3.1.0",
-        "info": {
-            "title": "Florence-2 Base Inference Server",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-        "security": [
-            { "ApiKeyAuth": [] },
-            { "BearerAuth": [] }
-        ],
-        "paths": {
-            "/health": {
-                "get": {
-                    "summary": "Liveness check",
-                    "security": [],
-                    "responses": {
-                        "200": {
-                            "description": "Process is alive",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } }
-                        }
-                    }
-                }
-            },
-            "/ready": {
-                "get": {
-                    "summary": "Readiness check",
-                    "security": [],
-                    "responses": {
-                        "200": { "description": "At least one worker is ready" },
-                        "503": { "description": "No model worker is ready" }
-                    }
-                }
-            },
-            "/metrics": {
-                "get": {
-                    "summary": "Runtime metrics snapshot",
-                    "responses": {
-                        "200": {
-                            "description": "Metrics snapshot",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetricsResponse" } } }
-                        },
-                        "401": { "$ref": "#/components/responses/Unauthorized" },
-                        "429": { "$ref": "#/components/responses/RateLimited" }
-                    }
-                }
-            },
-            "/v1/infer": {
-                "post": {
-                    "summary": "Queue inference from a multipart image upload",
-                    "requestBody": {
-                        "required": true,
-                        "content": { "multipart/form-data": { "schema": { "$ref": "#/components/schemas/UploadInferenceRequest" } } }
-                    },
-                    "responses": {
-                        "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
-                        "400": { "$ref": "#/components/responses/BadRequest" },
-                        "401": { "$ref": "#/components/responses/Unauthorized" },
-                        "429": { "$ref": "#/components/responses/RateLimited" },
-                        "503": { "$ref": "#/components/responses/ServiceUnavailable" }
-                    }
-                }
-            },
-            "/v1/infer/path": {
-                "post": {
-                    "summary": "Queue inference from a server-side image path",
-                    "requestBody": {
-                        "required": true,
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalPathRequest" } } }
-                    },
-                    "responses": {
-                        "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
-                        "400": { "$ref": "#/components/responses/BadRequest" },
-                        "401": { "$ref": "#/components/responses/Unauthorized" },
-                        "403": { "$ref": "#/components/responses/Forbidden" },
-                        "429": { "$ref": "#/components/responses/RateLimited" },
-                        "503": { "$ref": "#/components/responses/ServiceUnavailable" }
-                    }
-                }
-            },
-            "/v1/jobs/{id}": {
-                "get": {
-                    "summary": "Fetch a job record",
-                    "parameters": [{
-                        "name": "id",
-                        "in": "path",
-                        "required": true,
-                        "schema": { "type": "string", "format": "uuid" }
-                    }],
-                    "responses": {
-                        "200": { "description": "Job record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobRecord" } } } },
-                        "401": { "$ref": "#/components/responses/Unauthorized" },
-                        "429": { "$ref": "#/components/responses/RateLimited" },
-                        "404": { "$ref": "#/components/responses/NotFound" }
-                    }
-                }
-            }
-        },
-        "components": {
-            "responses": {
-                "BadRequest": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-                "Forbidden": { "description": "Forbidden", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-                "Unauthorized": { "description": "API key is missing or invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-                "RateLimited": { "description": "Request rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-                "NotFound": { "description": "Not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
-                "ServiceUnavailable": { "description": "Service unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
-            },
-            "securitySchemes": {
-                "ApiKeyAuth": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "x-api-key"
-                },
-                "BearerAuth": {
-                    "type": "http",
-                    "scheme": "bearer"
-                }
-            },
-            "schemas": {
-                "ErrorResponse": {
-                    "type": "object",
-                    "required": ["code", "message"],
-                    "properties": {
-                        "code": { "type": "string" },
-                        "message": { "type": "string" }
-                    }
-                },
-                "QueueResponse": {
-                    "type": "object",
-                    "required": ["id", "status", "status_url"],
-                    "properties": {
-                        "id": { "type": "string", "format": "uuid" },
-                        "status": { "type": "string" },
-                        "status_url": { "type": "string" }
-                    }
-                },
-                "LocalPathRequest": {
-                    "type": "object",
-                    "required": ["image_path"],
-                    "properties": {
-                        "image_path": { "type": "string" },
-                        "task_type": { "type": "string" },
-                        "task_prompt": { "type": "string" },
-                        "text_input": { "type": ["string", "null"] },
-                        "webhook_url": { "type": ["string", "null"], "format": "uri" },
-                        "task": { "type": "string", "deprecated": true }
-                    }
-                },
-                "UploadInferenceRequest": {
-                    "type": "object",
-                    "required": ["image"],
-                    "properties": {
-                        "image": { "type": "string", "format": "binary" },
-                        "task_type": { "type": "string" },
-                        "task_prompt": { "type": "string" },
-                        "text_input": { "type": "string" },
-                        "webhook_url": { "type": "string", "format": "uri" }
-                    }
-                },
-                "WorkerHealth": {
-                    "type": "object",
-                    "required": ["expected", "ready", "failed"],
-                    "properties": {
-                        "expected": { "type": "integer" },
-                        "ready": { "type": "integer" },
-                        "failed": { "type": "integer" }
-                    }
-                },
-                "HealthResponse": { "type": "object" },
-                "MetricsResponse": { "type": "object" },
-                "JobRecord": { "type": "object" }
-            }
-        }
-    })
+    let mut document: Value = serde_json::from_str(include_str!("../docs/openapi.json"))
+        .expect("embedded OpenAPI document must be valid JSON");
+    document["info"]["version"] = Value::String(env!("CARGO_PKG_VERSION").to_string());
+    document
 }
 
 fn cors_layer(allowed_origins: &[String]) -> CorsLayer {

@@ -343,18 +343,7 @@ pub async fn enqueue_record(
     record: JobRecord,
 ) -> Result<QueueResponse, EnqueueError> {
     let id = record.id;
-    let image_path = record.image_path.clone();
-    let task = TaskSpec::from_strings(
-        Some(record.task_type.clone()),
-        Some(record.task_prompt.clone()),
-        record.text_input.clone(),
-    )
-    .map_err(EnqueueError::InvalidTask)?;
-    let request = JobRequest {
-        id,
-        image_path,
-        task,
-    };
+    let request = job_request_from_record(&record)?;
 
     if state.queue_tx.is_full() {
         return Err(EnqueueError::QueueFull);
@@ -372,9 +361,9 @@ pub async fn enqueue_record(
     match state.queue_tx.try_send(request) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(_)) => {
-            state.jobs.write().await.remove(&id);
-            persist_unqueued_record(
-                &state.config.results_jsonl,
+            rollback_unqueued_record(
+                state,
+                id,
                 record,
                 "inference queue became full before the job could be queued",
             )
@@ -382,9 +371,9 @@ pub async fn enqueue_record(
             return Err(EnqueueError::QueueFull);
         }
         Err(async_channel::TrySendError::Closed(_)) => {
-            state.jobs.write().await.remove(&id);
-            persist_unqueued_record(
-                &state.config.results_jsonl,
+            rollback_unqueued_record(
+                state,
+                id,
                 record,
                 "inference queue closed before the job could be queued",
             )
@@ -393,9 +382,29 @@ pub async fn enqueue_record(
         }
     }
 
+    log_queued_job(&record, state.queue_tx.len());
+
+    Ok(queue_response(id))
+}
+
+fn job_request_from_record(record: &JobRecord) -> Result<JobRequest, EnqueueError> {
+    let task = TaskSpec::from_strings(
+        Some(record.task_type.clone()),
+        Some(record.task_prompt.clone()),
+        record.text_input.clone(),
+    )
+    .map_err(EnqueueError::InvalidTask)?;
+    Ok(JobRequest {
+        id: record.id,
+        image_path: record.image_path.clone(),
+        task,
+    })
+}
+
+fn log_queued_job(record: &JobRecord, queued: usize) {
     info!(
         "job queued job_id={} task_type={} task_prompt={} text_input_present={} input_kind={} image_path={} image_bytes={} sha256={} queued={}",
-        id,
+        record.id,
         record.task_type,
         record.task_prompt,
         record.text_input.is_some(),
@@ -403,14 +412,26 @@ pub async fn enqueue_record(
         record.image_path.display(),
         record.image_bytes,
         record.image_sha256,
-        state.queue_tx.len()
+        queued
     );
+}
 
-    Ok(QueueResponse {
+fn queue_response(id: Uuid) -> QueueResponse {
+    QueueResponse {
         id,
         status: JobStatus::Queued,
         status_url: format!("/v1/jobs/{id}"),
-    })
+    }
+}
+
+async fn rollback_unqueued_record(
+    state: &AppState,
+    id: Uuid,
+    record: JobRecord,
+    error: &str,
+) -> Result<(), EnqueueError> {
+    state.jobs.write().await.remove(&id);
+    persist_unqueued_record(&state.config.results_jsonl, record, error).await
 }
 
 async fn persist_unqueued_record(
@@ -437,131 +458,200 @@ pub fn start_workers(
     info!("starting model worker pool workers={}", config.workers);
     for worker_id in 0..config.workers {
         debug!("spawning model worker worker_id={}", worker_id);
-        let config = Arc::clone(&config);
-        let jobs = Arc::clone(&jobs);
-        let workers = Arc::clone(&workers);
-        let metrics = Arc::clone(&metrics);
-        let webhooks = Arc::clone(&webhooks);
-        let queue_rx = queue_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                let Some(mut worker) =
-                    initialize_worker(worker_id, Arc::clone(&config), &workers, &metrics).await
-                else {
-                    return;
-                };
+        tokio::spawn(worker_loop(
+            worker_id,
+            WorkerRuntime {
+                config: Arc::clone(&config),
+                jobs: Arc::clone(&jobs),
+                workers: Arc::clone(&workers),
+                metrics: Arc::clone(&metrics),
+                webhooks: Arc::clone(&webhooks),
+                queue_rx: queue_rx.clone(),
+            },
+        ));
+    }
+}
 
-                let mut restart_worker = false;
-                while let Ok(request) = queue_rx.recv().await {
-                    let job_span = tracing::info_span!(
-                        "inference_job",
-                        job_id = %request.id,
-                        worker_id,
-                        task_type = request.task.task_type_name(),
-                        task_prompt = request.task.task_prompt_name(),
-                    );
-                    job_span.in_scope(|| {
-                        debug!(
-                            "worker received job worker_id={} job_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
-                            worker_id,
-                            request.id,
-                            request.task.task_type_name(),
-                            request.task.task_prompt_name(),
-                            request.task.text_input.is_some(),
-                            request.image_path.display()
-                        );
-                    });
-                    metrics.record_job_started();
-                    let job_started = Instant::now();
-                    mark_running(&jobs, request.id).await;
+struct WorkerRuntime {
+    config: Arc<Config>,
+    jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
+    workers: Arc<WorkerPoolState>,
+    metrics: Arc<AppMetrics>,
+    webhooks: Arc<WebhookClient>,
+    queue_rx: Receiver<JobRequest>,
+}
 
-                    let join_handle = tokio::task::spawn_blocking({
-                        let image_path = request.image_path.clone();
-                        let task = request.task.clone();
-                        let mut worker = worker.take_for_blocking();
-                        let job_span = job_span.clone();
-                        move || {
-                            job_span.in_scope(|| {
-                                let result = worker.infer(&image_path, &task);
-                                (worker_id, worker, result)
-                            })
-                        }
-                    });
+async fn worker_loop(worker_id: usize, runtime: WorkerRuntime) {
+    loop {
+        let Some(mut worker) = initialize_worker(
+            worker_id,
+            Arc::clone(&runtime.config),
+            &runtime.workers,
+            &runtime.metrics,
+        )
+        .await
+        else {
+            return;
+        };
 
-                    let result = wait_for_inference(&config, join_handle).await;
-                    let elapsed_ms = job_started.elapsed().as_millis();
+        let should_restart = process_worker_queue(worker_id, &runtime, &mut worker).await;
 
-                    match result {
-                        InferenceRunResult::Completed(result) => match *result {
-                            Ok((_, returned_worker, Ok(metadata))) => {
-                                worker = returned_worker;
-                                metrics.record_job_succeeded(elapsed_ms);
-                                finish_job(
-                                    &config,
-                                    &jobs,
-                                    &metrics,
-                                    &webhooks,
-                                    request.id,
-                                    Ok(metadata),
-                                )
-                                .await;
-                            }
-                            Ok((_, returned_worker, Err(err))) => {
-                                worker = returned_worker;
-                                metrics.record_job_failed(elapsed_ms);
-                                finish_job(
-                                    &config,
-                                    &jobs,
-                                    &metrics,
-                                    &webhooks,
-                                    request.id,
-                                    Err(err),
-                                )
-                                .await;
-                            }
-                            Err(err) => {
-                                metrics.record_job_failed(elapsed_ms);
-                                metrics.record_worker_restart();
-                                finish_job(
-                                    &config,
-                                    &jobs,
-                                    &metrics,
-                                    &webhooks,
-                                    request.id,
-                                    Err(anyhow!("worker task failed: {err}")),
-                                )
-                                .await;
-                                restart_worker = true;
-                                break;
-                            }
-                        },
-                        InferenceRunResult::TimedOut => {
-                            metrics.record_job_timed_out(elapsed_ms);
-                            metrics.record_worker_restart();
-                            finish_job(
-                                &config,
-                                &jobs,
-                                &metrics,
-                                &webhooks,
-                                request.id,
-                                Err(anyhow!(
-                                    "job timed out after {} seconds",
-                                    config.job_timeout_seconds
-                                )),
-                            )
-                            .await;
-                            restart_worker = true;
-                            break;
-                        }
-                    }
-                }
+        runtime.workers.mark_stopped();
+        if !should_restart {
+            return;
+        }
+    }
+}
 
-                workers.mark_stopped();
-                if !restart_worker {
-                    return;
-                }
-            }
-        });
+async fn process_worker_queue(
+    worker_id: usize,
+    runtime: &WorkerRuntime,
+    worker: &mut FlorenceWorker,
+) -> bool {
+    while let Ok(request) = runtime.queue_rx.recv().await {
+        if process_worker_request(worker_id, runtime, request, worker).await {
+            return true;
+        }
+    }
+
+    false
+}
+
+async fn process_worker_request(
+    worker_id: usize,
+    runtime: &WorkerRuntime,
+    request: JobRequest,
+    worker: &mut FlorenceWorker,
+) -> bool {
+    let job_span = tracing::info_span!(
+        "inference_job",
+        job_id = %request.id,
+        worker_id,
+        task_type = request.task.task_type_name(),
+        task_prompt = request.task.task_prompt_name(),
+    );
+    job_span.in_scope(|| {
+        debug!(
+            "worker received job worker_id={} job_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
+            worker_id,
+            request.id,
+            request.task.task_type_name(),
+            request.task.task_prompt_name(),
+            request.task.text_input.is_some(),
+            request.image_path.display()
+        );
+    });
+    runtime.metrics.record_job_started();
+    let job_started = Instant::now();
+    mark_running(&runtime.jobs, request.id).await;
+
+    let join_handle = spawn_inference(worker_id, worker, &request, job_span);
+    let result = wait_for_inference(&runtime.config, join_handle).await;
+    let elapsed_ms = job_started.elapsed().as_millis();
+
+    handle_inference_result(runtime, request.id, elapsed_ms, result, worker).await
+}
+
+fn spawn_inference(
+    worker_id: usize,
+    worker: &mut FlorenceWorker,
+    request: &JobRequest,
+    job_span: tracing::Span,
+) -> BlockingInferenceJoin {
+    tokio::task::spawn_blocking({
+        let image_path = request.image_path.clone();
+        let task = request.task.clone();
+        let mut worker = worker.take_for_blocking();
+        move || {
+            job_span.in_scope(|| {
+                let result = worker.infer(&image_path, &task);
+                (worker_id, worker, result)
+            })
+        }
+    })
+}
+
+async fn handle_inference_result(
+    runtime: &WorkerRuntime,
+    job_id: Uuid,
+    elapsed_ms: u128,
+    result: InferenceRunResult,
+    worker: &mut FlorenceWorker,
+) -> bool {
+    match result {
+        InferenceRunResult::Completed(result) => {
+            handle_completed_inference(runtime, job_id, elapsed_ms, *result, worker).await
+        }
+        InferenceRunResult::TimedOut => {
+            runtime.metrics.record_job_timed_out(elapsed_ms);
+            runtime.metrics.record_worker_restart();
+            finish_job(
+                &runtime.config,
+                &runtime.jobs,
+                &runtime.metrics,
+                &runtime.webhooks,
+                job_id,
+                Err(anyhow!(
+                    "job timed out after {} seconds",
+                    runtime.config.job_timeout_seconds
+                )),
+            )
+            .await;
+            true
+        }
+    }
+}
+
+async fn handle_completed_inference(
+    runtime: &WorkerRuntime,
+    job_id: Uuid,
+    elapsed_ms: u128,
+    result: BlockingInferenceResult,
+    worker: &mut FlorenceWorker,
+) -> bool {
+    match result {
+        Ok((_, returned_worker, Ok(metadata))) => {
+            *worker = returned_worker;
+            runtime.metrics.record_job_succeeded(elapsed_ms);
+            finish_job(
+                &runtime.config,
+                &runtime.jobs,
+                &runtime.metrics,
+                &runtime.webhooks,
+                job_id,
+                Ok(metadata),
+            )
+            .await;
+            false
+        }
+        Ok((_, returned_worker, Err(err))) => {
+            *worker = returned_worker;
+            runtime.metrics.record_job_failed(elapsed_ms);
+            finish_job(
+                &runtime.config,
+                &runtime.jobs,
+                &runtime.metrics,
+                &runtime.webhooks,
+                job_id,
+                Err(err),
+            )
+            .await;
+            false
+        }
+        Err(err) => {
+            runtime.metrics.record_job_failed(elapsed_ms);
+            runtime.metrics.record_worker_restart();
+            finish_job(
+                &runtime.config,
+                &runtime.jobs,
+                &runtime.metrics,
+                &runtime.webhooks,
+                job_id,
+                Err(anyhow!("worker task failed: {err}")),
+            )
+            .await;
+            true
+        }
     }
 }
 

@@ -87,7 +87,12 @@ impl Config {
             string_list_setting("CORS_ALLOWED_ORIGINS", server.cors_allowed_origins);
         let api_keys = string_list_setting("API_KEYS", server.api_keys);
         let model_path_override = env_path("MODEL_PATH").or(model.path);
-        let model_variant = parse_model_variant(model.variant, model_path_override.is_some())?;
+        let model_path_selection = if model_path_override.is_some() {
+            ModelPathSelection::ExplicitPath
+        } else {
+            ModelPathSelection::VariantDefaultPath
+        };
+        let model_variant = parse_model_variant(model.variant, model_path_selection)?;
         let model_path = model_path_override.unwrap_or_else(|| model_variant.default_model_path());
         let addr = string_setting("BIND_ADDR", server.bind_addr, DEFAULT_ADDR)
             .parse()
@@ -480,15 +485,20 @@ fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ModelPathSelection {
+    ExplicitPath,
+    VariantDefaultPath,
+}
+
 fn parse_model_variant(
     file_value: Option<String>,
-    has_model_path_override: bool,
+    model_path_selection: ModelPathSelection,
 ) -> anyhow::Result<ModelVariant> {
     let Some(raw) = env::var("MODEL_VARIANT").ok().or(file_value) else {
-        return Ok(if has_model_path_override {
-            ModelVariant::Custom
-        } else {
-            ModelVariant::Fp32
+        return Ok(match model_path_selection {
+            ModelPathSelection::ExplicitPath => ModelVariant::Custom,
+            ModelPathSelection::VariantDefaultPath => ModelVariant::Fp32,
         });
     };
 
