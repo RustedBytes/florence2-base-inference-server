@@ -287,7 +287,7 @@ async fn compact_metadata(config: &Config, jobs: &HashMap<Uuid, JobRecord>) -> a
 
 async fn write_jsonl_records(path: &Path, records: &[JobRecord]) -> anyhow::Result<()> {
     let temp_path = path.with_extension("jsonl.tmp");
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(records.len().saturating_mul(256));
     for record in records {
         serde_json::to_writer(&mut bytes, record)?;
         bytes.push(b'\n');
@@ -743,8 +743,14 @@ fn redacted_webhook_url(webhook_url: &str) -> String {
     };
     url.set_query(None);
     url.set_fragment(None);
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
+    if url.set_username("").is_err() {
+        warn!("failed to redact webhook URL username");
+        return "<redacted webhook url>".to_string();
+    }
+    if url.set_password(None).is_err() {
+        warn!("failed to redact webhook URL password");
+        return "<redacted webhook url>".to_string();
+    }
     url.to_string()
 }
 
