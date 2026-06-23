@@ -14,6 +14,7 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY docs/openapi.json ./docs/openapi.json
 
 RUN set -eux; \
     cargo build --release --locked; \

@@ -22,6 +22,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY docs/openapi.json ./docs/openapi.json
 
 # Keep ort-sys on the CUDA 12 ONNX Runtime distribution to match the runtime image.
 ENV ORT_CUDA_VERSION=12
