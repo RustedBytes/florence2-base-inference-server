@@ -15,3 +15,35 @@ open http://127.0.0.1:3000/
 ```
 
 The browser UI template is embedded into the binary.
+
+## Podman
+
+Build the container image:
+
+```bash
+podman build -f Containerfile -t florence2-base-inference-server .
+```
+
+Run it with the downloaded model files mounted at the default path:
+
+```bash
+podman volume create florence2-data
+podman run --rm \
+  -p 3000:3000 \
+  -v "$PWD/Florence-2-base:/app/Florence-2-base:ro" \
+  -v florence2-data:/app/data:U \
+  florence2-base-inference-server
+```
+
+The image does not include ONNX model files. Download them separately and mount the `Florence-2-base/` directory into `/app/Florence-2-base`.
+
+To use a custom config file:
+
+```bash
+podman run --rm \
+  -p 3000:3000 \
+  -v "$PWD/Florence-2-base:/app/Florence-2-base:ro" \
+  -v "$PWD/config.toml:/app/config.toml:ro" \
+  -v florence2-data:/app/data:U \
+  florence2-base-inference-server
+```
