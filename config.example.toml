@@ -1,0 +1,21 @@
+[server]
+bind_addr = "127.0.0.1:3000"
+data_dir = "data"
+
+[model]
+# Supported variants: fp32, fp16, int8, uint8, quantized, q4, q4f16, bnb4, custom
+variant = "fp16"
+
+# Optional explicit ONNX path. When set, this overrides variant path selection.
+# path = "Florence-2-base/onnx/vision_encoder.onnx"
+
+[queue]
+model_pool_size = 1
+queue_size = 128
+body_limit_bytes = 33554432
+
+[generation]
+max_new_tokens = 256
+
+[logging]
+rust_log = "info,ort=warn"
