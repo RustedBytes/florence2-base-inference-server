@@ -1,8 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
-};
+mod model;
+
+use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Context, anyhow};
 use half::f16;
@@ -10,11 +8,7 @@ use image::{DynamicImage, GenericImageView, ImageReader, imageops::FilterType};
 use log::{debug, info, trace, warn};
 use ort::{
     environment::Environment,
-    ep::{self, ExecutionProviderDispatch},
-    session::{
-        Session,
-        builder::{AutoDevicePolicy, GraphOptimizationLevel},
-    },
+    session::Session,
     value::{DynValue, Shape, Tensor, TensorElementType, ValueType},
 };
 use serde_json::{Value, json};
@@ -24,6 +18,8 @@ use crate::{
     config::{Config, ModelVariant},
     types::{GenerationMetadata, InferenceMetadata, TaskSpec, TaskType, TensorMetadata},
 };
+
+use self::model::{FlorenceModelPaths, image_input_metadata, load_session};
 
 const IMAGE_SIDE: u32 = 768;
 const HIDDEN_SIZE: i64 = 768;
@@ -523,60 +519,6 @@ impl FlorenceWorker {
 }
 
 #[derive(Debug, Clone)]
-struct FlorenceModelPaths {
-    model_dir: PathBuf,
-    vision_encoder: PathBuf,
-    embed_tokens: PathBuf,
-    encoder_model: PathBuf,
-    decoder_model: PathBuf,
-    decoder_with_past_model: PathBuf,
-}
-
-impl FlorenceModelPaths {
-    fn from_vision_path(vision_encoder: &Path, variant: ModelVariant) -> Self {
-        let onnx_dir = vision_encoder
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let model_dir = onnx_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| onnx_dir.clone());
-        let suffix = model_suffix(vision_encoder, variant);
-
-        Self {
-            model_dir,
-            vision_encoder: vision_encoder.to_path_buf(),
-            embed_tokens: onnx_dir.join(format!("embed_tokens{suffix}.onnx")),
-            encoder_model: onnx_dir.join(format!("encoder_model{suffix}.onnx")),
-            decoder_model: onnx_dir.join(format!("decoder_model{suffix}.onnx")),
-            decoder_with_past_model: onnx_dir.join(format!("decoder_with_past_model{suffix}.onnx")),
-        }
-    }
-
-    fn ensure_exists(&self) -> anyhow::Result<()> {
-        for path in [
-            &self.vision_encoder,
-            &self.embed_tokens,
-            &self.encoder_model,
-            &self.decoder_model,
-            &self.decoder_with_past_model,
-        ] {
-            if !path.exists() {
-                return Err(anyhow!("model file does not exist: {}", path.display()));
-            }
-        }
-        if !self.model_dir.join("tokenizer.json").exists() {
-            return Err(anyhow!(
-                "tokenizer file does not exist: {}",
-                self.model_dir.join("tokenizer.json").display()
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
 struct ResolvedTask {
     task_token: String,
     prompt_text: String,
@@ -617,117 +559,6 @@ impl TensorData {
     }
 }
 
-fn load_session(path: &Path, execution_providers: &[String]) -> anyhow::Result<Session> {
-    let requested_eps = execution_provider_dispatches(execution_providers);
-    let use_auto_device = execution_providers
-        .iter()
-        .any(|provider| matches!(provider.as_str(), "auto" | "autodevice"));
-    let cpu_only = execution_providers
-        .iter()
-        .all(|provider| provider.as_str() == "cpu");
-    let has_requested_eps = !requested_eps.is_empty();
-
-    // Keep explicit EP registration opt-in. CoreML can register on Apple
-    // Silicon but still spend a long time compiling unsupported dynamic graphs.
-    let mut builder = Session::builder()
-        .map_err(|err| anyhow!("failed to create ONNX session builder: {err}"))?
-        .with_optimization_level(GraphOptimizationLevel::All)
-        .map_err(|err| anyhow!("failed to set ONNX graph optimization level: {err}"))?
-        .with_prepacking(true)
-        .map_err(|err| anyhow!("failed to enable ONNX prepacking: {err}"))?
-        .with_memory_pattern(false)
-        .map_err(|err| anyhow!("failed to configure ONNX memory pattern optimization: {err}"))?;
-
-    if execution_providers
-        .iter()
-        .any(|provider| provider.as_str() == "cuda")
-    {
-        builder = builder
-            .with_device_allocated_initializers()
-            .map_err(|err| anyhow!("failed to enable ONNX device-allocated initializers: {err}"))?;
-    }
-
-    if has_requested_eps {
-        builder = builder
-            .with_execution_providers(&requested_eps)
-            .map_err(|err| {
-                anyhow!(
-                    "failed to register ONNX execution providers for {}: {err}",
-                    path.display()
-                )
-            })?;
-    }
-
-    if use_auto_device || (!has_requested_eps && !cpu_only) {
-        builder = builder
-            .with_auto_device(AutoDevicePolicy::MaxPerformance)
-            .map_err(|err| anyhow!("failed to enable ONNX Runtime auto device selection: {err}"))?;
-    }
-
-    builder
-        .commit_from_file(path)
-        .map_err(|err| anyhow!("failed to load ONNX model {}: {err}", path.display()))
-}
-
-fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<ExecutionProviderDispatch> {
-    execution_providers
-        .iter()
-        .filter_map(|provider| execution_provider_dispatch(provider))
-        .collect()
-}
-
-fn execution_provider_dispatch(provider: &str) -> Option<ExecutionProviderDispatch> {
-    match provider {
-        "coreml" => Some(coreml_execution_provider(
-            ep::coreml::ComputeUnits::All,
-            true,
-        )),
-        "coremlgpu" => Some(coreml_execution_provider(
-            ep::coreml::ComputeUnits::CPUAndGPU,
-            true,
-        )),
-        "coremlnpu" | "coremlane" | "ane" | "npu" => Some(coreml_execution_provider(
-            ep::coreml::ComputeUnits::CPUAndNeuralEngine,
-            false,
-        )),
-        "cuda" => cuda_execution_provider(),
-        "xnnpack" => Some(ep::XNNPACK::default().build()),
-        "auto" | "autodevice" | "cpu" => None,
-        other => {
-            warn!("unknown execution provider `{other}` ignored");
-            None
-        }
-    }
-}
-
-fn coreml_execution_provider(
-    compute_units: ep::coreml::ComputeUnits,
-    low_precision_accumulation_on_gpu: bool,
-) -> ExecutionProviderDispatch {
-    ep::CoreML::default()
-        .with_compute_units(compute_units)
-        .with_model_format(ep::coreml::ModelFormat::MLProgram)
-        .with_low_precision_accumulation_on_gpu(low_precision_accumulation_on_gpu)
-        .build()
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_execution_provider() -> Option<ExecutionProviderDispatch> {
-    Some(
-        ep::CUDA::default()
-            .with_tf32(true)
-            .with_prefer_nhwc(true)
-            .with_conv_max_workspace(true)
-            .build(),
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_execution_provider() -> Option<ExecutionProviderDispatch> {
-    warn!("CUDA execution provider requested but this binary was built without `--features cuda`");
-    None
-}
-
 fn preprocess_image(image: DynamicImage) -> anyhow::Result<Vec<f32>> {
     trace!(
         "resizing and normalizing image target_width={} target_height={}",
@@ -754,25 +585,6 @@ fn preprocess_image(image: DynamicImage) -> anyhow::Result<Vec<f32>> {
     }
 
     Ok(chw)
-}
-
-fn image_input_metadata(session: &Session) -> anyhow::Result<(String, TensorElementType)> {
-    let input = session
-        .inputs()
-        .iter()
-        .find(|input| input.name() == "pixel_values")
-        .or_else(|| session.inputs().first())
-        .ok_or_else(|| anyhow!("ONNX model has no inputs"))?;
-
-    let ValueType::Tensor { ty, .. } = input.dtype() else {
-        return Err(anyhow!(
-            "ONNX image input `{}` is not a tensor: {:?}",
-            input.name(),
-            input.dtype()
-        ));
-    };
-
-    Ok((input.name().to_string(), *ty))
 }
 
 fn extract_output_tensor(value: &DynValue, name: &str) -> anyhow::Result<TensorData> {
@@ -1072,30 +884,6 @@ fn clean_generated_text(raw: &str) -> String {
         .to_string()
 }
 
-fn model_suffix(vision_encoder: &Path, variant: ModelVariant) -> String {
-    if !matches!(variant, ModelVariant::Custom) {
-        return match variant {
-            ModelVariant::Fp32 => "",
-            ModelVariant::Fp16 => "_fp16",
-            ModelVariant::Int8 => "_int8",
-            ModelVariant::Uint8 => "_uint8",
-            ModelVariant::Quantized => "_quantized",
-            ModelVariant::Q4 => "_q4",
-            ModelVariant::Q4F16 => "_q4f16",
-            ModelVariant::Bnb4 => "_bnb4",
-            ModelVariant::Custom => unreachable!(),
-        }
-        .to_string();
-    }
-
-    vision_encoder
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix("vision_encoder"))
-        .unwrap_or("")
-        .to_string()
-}
-
 fn tensor_metadata_f32(name: &str, shape: &Shape, data: &[f32]) -> TensorMetadata {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
@@ -1118,32 +906,4 @@ fn tensor_metadata_f32(name: &str, shape: &Shape, data: &[f32]) -> TensorMetadat
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_ocr_region_location_tokens_into_bbox() {
-        let generated =
-            "let x = 5:<loc_213><loc_402><loc_789><loc_402><loc_789><loc_503><loc_213><loc_502>";
-
-        let result = post_process_generation("<OCR_WITH_REGION>", generated, (1254, 1254));
-        let item = &result["<OCR_WITH_REGION>"]["items"][0];
-
-        assert_eq!(item["text"], "let x = 5:");
-        assert_eq!(item["loc_tokens"][0], 213);
-        assert_eq!(item["loc_tokens"][7], 502);
-        assert_eq!(item["bbox"]["x_min"], 267.369);
-        assert_eq!(item["bbox"]["y_min"], 504.613);
-        assert_eq!(item["bbox"]["x_max"], 990.396);
-        assert_eq!(item["bbox"]["y_max"], 631.393);
-        assert_eq!(item["polygon"].as_array().unwrap().len(), 4);
-    }
-
-    #[test]
-    fn cuda_provider_is_feature_gated() {
-        let providers = vec!["cuda".to_string()];
-        let dispatches = execution_provider_dispatches(&providers);
-
-        assert_eq!(dispatches.len(), usize::from(cfg!(feature = "cuda")));
-    }
-}
+mod tests;
