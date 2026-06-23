@@ -22,6 +22,7 @@ bind_addr = "127.0.0.1:3000"
 data_dir = "data"
 allow_local_paths = false
 local_path_roots = []
+cors_allowed_origins = []
 
 [model]
 variant = "fp32"
@@ -91,6 +92,7 @@ Environment variables override TOML values when set:
 - `DATA_DIR`: image and JSONL metadata directory, default `data`
 - `ALLOW_LOCAL_PATHS`: set to `true` to enable `/v1/infer/path`
 - `LOCAL_PATH_ROOTS`: platform-separated allowed roots for `/v1/infer/path`
+- `CORS_ALLOWED_ORIGINS`: comma-separated origins allowed by browser CORS checks
 - `MODEL_POOL_SIZE`: number of model workers
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: multipart upload limit
@@ -110,3 +112,12 @@ local_path_roots = ["/srv/florence-inputs"]
 ```
 
 Only files under the configured roots are accepted. The server rejects startup configuration where local paths are enabled without at least one root.
+
+CORS response headers are disabled by default. Configure explicit allowed origins for browser clients:
+
+```toml
+[server]
+cors_allowed_origins = ["http://localhost:5173"]
+```
+
+Only `GET`, `POST`, and `OPTIONS` methods are allowed by the CORS layer.

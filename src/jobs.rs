@@ -400,6 +400,7 @@ mod tests {
             results_jsonl: PathBuf::from("data/metadata/results.jsonl"),
             allow_local_paths: false,
             local_path_roots: Vec::new(),
+            cors_allowed_origins: Vec::new(),
             workers: 1,
             queue_size: 1,
             body_limit_bytes: 1024,

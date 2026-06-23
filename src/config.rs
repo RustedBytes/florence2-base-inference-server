@@ -26,6 +26,7 @@ pub struct Config {
     pub results_jsonl: PathBuf,
     pub allow_local_paths: bool,
     pub local_path_roots: Vec<PathBuf>,
+    pub cors_allowed_origins: Vec<String>,
     pub workers: usize,
     pub queue_size: usize,
     pub body_limit_bytes: usize,
@@ -53,6 +54,8 @@ impl Config {
                 "local path inference requires at least one configured local_path_roots entry"
             ));
         }
+        let cors_allowed_origins =
+            string_list_setting("CORS_ALLOWED_ORIGINS", server.cors_allowed_origins);
         let model_path_override = env_path("MODEL_PATH").or(model.path);
         let model_variant = parse_model_variant(model.variant, model_path_override.is_some())?;
         let model_path = model_path_override.unwrap_or_else(|| model_variant.default_model_path());
@@ -69,6 +72,7 @@ impl Config {
             results_jsonl: metadata_dir.join("results.jsonl"),
             allow_local_paths,
             local_path_roots,
+            cors_allowed_origins,
             metadata_dir,
             data_dir,
             workers: usize_setting(
@@ -158,6 +162,7 @@ struct ServerConfig {
     data_dir: Option<PathBuf>,
     allow_local_paths: Option<bool>,
     local_path_roots: Option<Vec<PathBuf>>,
+    cors_allowed_origins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -287,6 +292,20 @@ fn path_list_setting(key: &str, file_value: Option<Vec<PathBuf>>) -> Vec<PathBuf
         .unwrap_or_default()
 }
 
+fn string_list_setting(key: &str, file_value: Option<Vec<String>>) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .or(file_value)
+        .unwrap_or_default()
+}
+
 fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {
     // Keep provider names normalized once here; inference can then match simple
     // strings without accepting every spelling variant again.
@@ -397,6 +416,25 @@ mod tests {
         ]));
 
         assert_eq!(providers, vec!["coremlgpu", "cuda", "xnnpack"]);
+    }
+
+    #[test]
+    fn keeps_configured_cors_origins() {
+        let origins = string_list_setting(
+            "CORS_ALLOWED_ORIGINS_UNUSED_IN_TEST",
+            Some(vec![
+                "http://localhost:5173".to_string(),
+                "https://example.com".to_string(),
+            ]),
+        );
+
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:5173".to_string(),
+                "https://example.com".to_string()
+            ]
+        );
     }
 
     #[test]

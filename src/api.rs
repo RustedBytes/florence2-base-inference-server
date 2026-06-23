@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Request, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -15,6 +15,7 @@ use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::fs;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
 use crate::{
@@ -29,7 +30,8 @@ use crate::{
 };
 
 pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
-    Router::new()
+    let cors_allowed_origins = state.config.cors_allowed_origins.clone();
+    let router = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/ready", get(readiness))
@@ -39,7 +41,13 @@ pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
         .route("/v1/jobs/{id}", get(get_job))
         .layer(DefaultBodyLimit::max(body_limit_bytes))
         .layer(middleware::from_fn(log_request))
-        .with_state(state)
+        .with_state(state);
+
+    if cors_allowed_origins.is_empty() {
+        router
+    } else {
+        router.layer(cors_layer(&cors_allowed_origins))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -484,6 +492,24 @@ fn worker_health(state: &AppState) -> WorkerHealth {
     }
 }
 
+fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let origins = allowed_origins
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(origin) => Some(origin),
+            Err(err) => {
+                warn!("invalid CORS origin ignored origin={origin:?} error={err}");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -608,6 +634,7 @@ mod tests {
                 results_jsonl: PathBuf::from("data/metadata/results.jsonl"),
                 allow_local_paths,
                 local_path_roots,
+                cors_allowed_origins: Vec::new(),
                 workers: 1,
                 queue_size: 1,
                 body_limit_bytes: 1024,
