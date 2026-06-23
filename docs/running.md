@@ -47,3 +47,19 @@ podman run --rm \
   -v florence2-data:/app/data:U \
   florence2-base-inference-server
 ```
+
+## Compose
+
+Build and run with Compose:
+
+```bash
+podman compose -f compose.yml up --build
+```
+
+Docker Compose works with the same file:
+
+```bash
+docker compose -f compose.yml up --build
+```
+
+The Compose file mounts `./Florence-2-base` into the container read-only and stores runtime data in the `florence2-data` named volume.
