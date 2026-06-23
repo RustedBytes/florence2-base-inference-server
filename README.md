@@ -1,5 +1,7 @@
 # Florence 2 Base Inference Server
 
+[![Rust](https://github.com/RustedBytes/florence2-base-inference-server/actions/workflows/rust.yml/badge.svg)](https://github.com/RustedBytes/florence2-base-inference-server/actions/workflows/rust.yml)
+
 Minimal Axum server for running Florence-2-base ONNX image-to-text inference in a background worker queue.
 
 ![Florence-2 inference server preview](docs/demo.jpg)
