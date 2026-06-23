@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use async_channel::bounded;
 use axum::body::Body;
@@ -8,6 +8,9 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 use tower_http::timeout::TimeoutLayer;
 
+use super::submit::{
+    ensure_local_path_allowed, task_spec_from_request, validate_image_bytes, validate_webhook_url,
+};
 use super::system::parse_nvidia_smi_memory;
 use super::*;
 use crate::{
