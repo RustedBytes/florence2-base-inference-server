@@ -22,6 +22,8 @@ const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_WEBHOOK_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_WEBHOOK_MAX_ATTEMPTS: usize = 1;
+const DEFAULT_WEBHOOK_INITIAL_BACKOFF_MS: u64 = 500;
 const DEFAULT_ALLOW_PRIVATE_WEBHOOK_URLS: bool = false;
 
 pub struct Config {
@@ -36,6 +38,8 @@ pub struct Config {
     pub allow_local_paths: bool,
     pub local_path_roots: Vec<PathBuf>,
     pub cors_allowed_origins: Vec<String>,
+    pub api_keys: Vec<String>,
+    pub rate_limit_requests_per_minute: u64,
     pub job_retention_limit: usize,
     pub metadata_retention_limit: usize,
     pub max_image_width: u32,
@@ -49,6 +53,10 @@ pub struct Config {
     pub request_timeout_seconds: u64,
     pub webhook_timeout_seconds: u64,
     pub webhook_connect_timeout_seconds: u64,
+    pub webhook_max_attempts: usize,
+    pub webhook_initial_backoff_ms: u64,
+    pub webhook_signing_secret: Option<String>,
+    pub webhooks_dead_letter_jsonl: PathBuf,
     pub allow_private_webhook_urls: bool,
     pub execution_providers: Vec<String>,
 }
@@ -67,6 +75,7 @@ impl Config {
 
         let data_dir = path_setting("DATA_DIR", server.data_dir, DEFAULT_DATA_DIR);
         let metadata_dir = data_dir.join("metadata");
+        let webhooks_dead_letter_jsonl = metadata_dir.join("webhooks_dead_letter.jsonl");
         let allow_local_paths = bool_setting("ALLOW_LOCAL_PATHS", server.allow_local_paths, false)?;
         let local_path_roots = path_list_setting("LOCAL_PATH_ROOTS", server.local_path_roots);
         if allow_local_paths && local_path_roots.is_empty() {
@@ -76,6 +85,7 @@ impl Config {
         }
         let cors_allowed_origins =
             string_list_setting("CORS_ALLOWED_ORIGINS", server.cors_allowed_origins);
+        let api_keys = string_list_setting("API_KEYS", server.api_keys);
         let model_path_override = env_path("MODEL_PATH").or(model.path);
         let model_variant = parse_model_variant(model.variant, model_path_override.is_some())?;
         let model_path = model_path_override.unwrap_or_else(|| model_variant.default_model_path());
@@ -93,6 +103,12 @@ impl Config {
             allow_local_paths,
             local_path_roots,
             cors_allowed_origins,
+            api_keys,
+            rate_limit_requests_per_minute: u64_setting(
+                "RATE_LIMIT_REQUESTS_PER_MINUTE",
+                server.rate_limit_requests_per_minute,
+                0,
+            )?,
             job_retention_limit: usize_setting(
                 "JOB_RETENTION_LIMIT",
                 retention.job_retention_limit,
@@ -154,6 +170,22 @@ impl Config {
                 generation.webhook_connect_timeout_seconds,
                 DEFAULT_WEBHOOK_CONNECT_TIMEOUT_SECONDS,
             )?,
+            webhook_max_attempts: usize_setting(
+                "WEBHOOK_MAX_ATTEMPTS",
+                generation.webhook_max_attempts,
+                DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+            )?
+            .max(1),
+            webhook_initial_backoff_ms: u64_setting(
+                "WEBHOOK_INITIAL_BACKOFF_MS",
+                generation.webhook_initial_backoff_ms,
+                DEFAULT_WEBHOOK_INITIAL_BACKOFF_MS,
+            )?,
+            webhook_signing_secret: secret_setting(
+                "WEBHOOK_SIGNING_SECRET",
+                generation.webhook_signing_secret,
+            ),
+            webhooks_dead_letter_jsonl,
             allow_private_webhook_urls: bool_setting(
                 "ALLOW_PRIVATE_WEBHOOK_URLS",
                 generation.allow_private_webhook_urls,
@@ -230,6 +262,8 @@ struct ServerConfig {
     allow_local_paths: Option<bool>,
     local_path_roots: Option<Vec<PathBuf>>,
     cors_allowed_origins: Option<Vec<String>>,
+    api_keys: Option<Vec<String>>,
+    rate_limit_requests_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -252,6 +286,9 @@ struct GenerationConfig {
     job_timeout_seconds: Option<u64>,
     webhook_timeout_seconds: Option<u64>,
     webhook_connect_timeout_seconds: Option<u64>,
+    webhook_max_attempts: Option<usize>,
+    webhook_initial_backoff_ms: Option<u64>,
+    webhook_signing_secret: Option<String>,
     allow_private_webhook_urls: Option<bool>,
 }
 
@@ -406,6 +443,14 @@ fn string_list_setting(key: &str, file_value: Option<Vec<String>>) -> Vec<String
         })
         .or(file_value)
         .unwrap_or_default()
+}
+
+fn secret_setting(key: &str, file_value: Option<String>) -> Option<String> {
+    env::var(key)
+        .ok()
+        .or(file_value)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {
@@ -581,6 +626,8 @@ mod tests {
 [server]
 bind_addr = "127.0.0.1:9999"
 data_dir = "tmp-data"
+api_keys = ["secret"]
+rate_limit_requests_per_minute = 120
 
 [model]
 variant = "q4-f16"
@@ -604,6 +651,9 @@ max_new_tokens = 32
 job_timeout_seconds = 45
 webhook_timeout_seconds = 12
 webhook_connect_timeout_seconds = 3
+webhook_max_attempts = 4
+webhook_initial_backoff_ms = 250
+webhook_signing_secret = "webhook-secret"
 allow_private_webhook_urls = true
 
 [runtime]
@@ -629,6 +679,8 @@ rust_log = "debug"
 
         assert_eq!(server.bind_addr.as_deref(), Some("127.0.0.1:9999"));
         assert_eq!(server.data_dir, Some(PathBuf::from("tmp-data")));
+        assert_eq!(server.api_keys, Some(vec!["secret".to_string()]));
+        assert_eq!(server.rate_limit_requests_per_minute, Some(120));
         assert_eq!(model.variant.as_deref(), Some("q4-f16"));
         assert_eq!(queue.model_pool_size, Some(2));
         assert_eq!(queue.queue_size, Some(8));
@@ -642,6 +694,12 @@ rust_log = "debug"
         assert_eq!(generation.job_timeout_seconds, Some(45));
         assert_eq!(generation.webhook_timeout_seconds, Some(12));
         assert_eq!(generation.webhook_connect_timeout_seconds, Some(3));
+        assert_eq!(generation.webhook_max_attempts, Some(4));
+        assert_eq!(generation.webhook_initial_backoff_ms, Some(250));
+        assert_eq!(
+            generation.webhook_signing_secret.as_deref(),
+            Some("webhook-secret")
+        );
         assert_eq!(generation.allow_private_webhook_urls, Some(true));
         assert_eq!(
             runtime.execution_providers,

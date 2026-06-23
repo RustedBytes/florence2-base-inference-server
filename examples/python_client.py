@@ -31,11 +31,18 @@ class ClientError(RuntimeError):
 
 
 class FlorenceClient:
-    def __init__(self, base_url: str, read_timeout: float, connect_timeout: float) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        read_timeout: float,
+        connect_timeout: float,
+        api_key: str | None,
+    ) -> None:
         if urllib3 is None:
             raise ClientError("urllib3 is not installed; run `python3 -m pip install urllib3`")
 
         self.base_url = base_url.rstrip("/") + "/"
+        self.default_headers = {"x-api-key": api_key} if api_key else {}
         self.http = urllib3.PoolManager(
             timeout=urllib3.Timeout(connect=connect_timeout, read=read_timeout),
             retries=False,
@@ -106,12 +113,16 @@ class FlorenceClient:
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        request_headers = dict(self.default_headers)
+        if headers:
+            request_headers.update(headers)
+
         response = self.http.request(
             method,
             urljoin(self.base_url, path),
             fields=fields,
             body=body,
-            headers=headers,
+            headers=request_headers,
         )
         raw_body = response.data.decode("utf-8", errors="replace")
         if response.status >= 400:
@@ -130,6 +141,7 @@ class FlorenceClient:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--api-key", help="optional API key sent as x-api-key")
     parser.add_argument("--task-type", default="Single task")
     parser.add_argument("--task-prompt", default="Caption")
     parser.add_argument("--text-input")
@@ -151,7 +163,7 @@ def main() -> int:
     job_parser.add_argument("job_id")
 
     args = parser.parse_args()
-    client = FlorenceClient(args.base_url, args.read_timeout, args.connect_timeout)
+    client = FlorenceClient(args.base_url, args.read_timeout, args.connect_timeout, args.api_key)
 
     try:
         if args.command == "upload":

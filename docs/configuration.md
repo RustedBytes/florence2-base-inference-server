@@ -23,6 +23,8 @@ data_dir = "data"
 allow_local_paths = false
 local_path_roots = []
 cors_allowed_origins = []
+api_keys = []
+rate_limit_requests_per_minute = 0
 
 [model]
 variant = "fp32"
@@ -47,6 +49,9 @@ max_new_tokens = 256
 job_timeout_seconds = 300
 webhook_timeout_seconds = 10
 webhook_connect_timeout_seconds = 5
+webhook_max_attempts = 1
+webhook_initial_backoff_ms = 500
+webhook_signing_secret = ""
 allow_private_webhook_urls = false
 
 [runtime]
@@ -106,6 +111,8 @@ Environment variables override TOML values when set:
 - `ALLOW_LOCAL_PATHS`: set to `true` to enable `/v1/infer/path`
 - `LOCAL_PATH_ROOTS`: platform-separated allowed roots for `/v1/infer/path`
 - `CORS_ALLOWED_ORIGINS`: comma-separated origins allowed by browser CORS checks
+- `API_KEYS`: comma-separated accepted API keys; empty disables API key authentication
+- `RATE_LIMIT_REQUESTS_PER_MINUTE`: process-wide request limit; set to `0` to disable rate limiting
 - `MODEL_POOL_SIZE`: number of model workers
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: multipart upload limit
@@ -120,6 +127,9 @@ Environment variables override TOML values when set:
 - `JOB_TIMEOUT_SECONDS`: per-job inference timeout; set to `0` to disable timeout enforcement
 - `WEBHOOK_TIMEOUT_SECONDS`: total outbound webhook request timeout; set to `0` to disable
 - `WEBHOOK_CONNECT_TIMEOUT_SECONDS`: outbound webhook connection timeout; set to `0` to disable
+- `WEBHOOK_MAX_ATTEMPTS`: maximum webhook delivery attempts, including the first attempt
+- `WEBHOOK_INITIAL_BACKOFF_MS`: initial webhook retry backoff; later retries double this delay
+- `WEBHOOK_SIGNING_SECRET`: HMAC-SHA256 signing secret for webhook bodies; empty disables signatures
 - `ALLOW_PRIVATE_WEBHOOK_URLS`: set to `true` only in trusted deployments that must call local or private webhook targets
 - `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
@@ -144,6 +154,21 @@ cors_allowed_origins = ["http://localhost:5173"]
 
 Only `GET`, `POST`, and `OPTIONS` methods are allowed by the CORS layer.
 
+API key authentication is disabled by default. Configure one or more keys to protect all endpoints except `/health` and `/ready`:
+
+```toml
+[server]
+api_keys = ["replace-with-a-long-random-secret"]
+```
+
+Clients can send the key with either `x-api-key` or a bearer token:
+
+```bash
+curl -H 'x-api-key: replace-with-a-long-random-secret' http://127.0.0.1:3000/metrics
+```
+
+Rate limiting is also disabled by default. When `server.rate_limit_requests_per_minute` is greater than `0`, the server applies a process-wide fixed-window limit to all endpoints except `/health` and `/ready`. Exceeded requests return `429 Too Many Requests` with `Retry-After`.
+
 Request validation happens before the image is decoded for inference:
 
 - `queue.body_limit_bytes` limits multipart upload size.
@@ -153,6 +178,8 @@ Request validation happens before the image is decoded for inference:
 
 Jobs are marked failed if inference exceeds `generation.job_timeout_seconds`. A timed-out blocking inference task may finish in the background, so the worker slot is restarted before it accepts more work.
 
-Webhook delivery uses `generation.webhook_timeout_seconds` for the full request and `generation.webhook_connect_timeout_seconds` for establishing the connection. Webhook timeout failures are logged and do not change the completed job result.
+Webhook delivery uses `generation.webhook_timeout_seconds` for the full request and `generation.webhook_connect_timeout_seconds` for establishing the connection. Failed webhook deliveries retry up to `generation.webhook_max_attempts` times with exponential backoff starting at `generation.webhook_initial_backoff_ms`. Final failures are appended to `data/metadata/webhooks_dead_letter.jsonl`. Webhook failures are logged and do not change the completed job result.
+
+When `generation.webhook_signing_secret` is set, webhook requests include `x-florence-signature: sha256=<hex-hmac>`, computed over the exact JSON request body. Webhook requests also include `x-florence-event-id`, `x-florence-event-type`, and `x-florence-delivery-attempt`.
 
 For SSRF protection, webhook URLs reject credentials, fragments, localhost, and literal private/local IP addresses by default. Redirects are not followed. If private webhook targets are required in a trusted network, set `generation.allow_private_webhook_urls = true`.

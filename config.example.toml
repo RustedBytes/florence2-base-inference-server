@@ -10,6 +10,13 @@ local_path_roots = []
 # Example: ["http://localhost:5173"]
 cors_allowed_origins = []
 
+# Empty by default, which disables API key authentication.
+# When set, send either `x-api-key: <key>` or `Authorization: Bearer <key>`.
+api_keys = []
+
+# Disabled by default. When greater than 0, applies a process-wide request limit.
+rate_limit_requests_per_minute = 0
+
 [model]
 # Supported variants: fp32, fp16, int8, uint8, quantized, q4, q4f16, bnb4, custom
 variant = "fp16"
@@ -46,6 +53,14 @@ job_timeout_seconds = 300
 # Set either value to 0 to disable that webhook timeout.
 webhook_timeout_seconds = 10
 webhook_connect_timeout_seconds = 5
+
+# Webhooks retry failed deliveries with exponential backoff.
+webhook_max_attempts = 1
+webhook_initial_backoff_ms = 500
+
+# Empty by default, which disables webhook HMAC signatures.
+# When set, webhooks include `x-florence-signature: sha256=<hex-hmac>`.
+webhook_signing_secret = ""
 
 # Keep false unless this service runs in a trusted network and must call private webhook targets.
 allow_private_webhook_urls = false

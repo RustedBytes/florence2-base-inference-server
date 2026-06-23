@@ -6,6 +6,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
+type HmacSha256 = hmac::Hmac<Sha256>;
+
 pub async fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
@@ -34,6 +36,19 @@ pub async fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> anyhow::Resul
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn hmac_sha256_hex(secret: &str, bytes: &[u8]) -> String {
+    use hmac::Mac;
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts secrets of any length");
+    mac.update(bytes);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn guess_extension(content_type: Option<&str>, bytes: &[u8]) -> &'static str {
@@ -90,6 +105,14 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn signs_bytes_as_lowercase_hmac_sha256_hex() {
+        assert_eq!(
+            hmac_sha256_hex("secret", b"payload"),
+            "b82fcb791acec57859b989b430a826488ce2e479fdf92326bd0a2e8375a42ba4"
         );
     }
 

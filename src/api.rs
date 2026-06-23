@@ -2,6 +2,7 @@ use std::{
     io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -31,12 +32,12 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     jobs::{EnqueueError, enqueue_record},
-    state::AppState,
+    state::{AppState, RateLimitDecision},
     templates::IndexTemplate,
     types::{
-        CASCADED_TASK_PROMPTS, ErrorResponse, HealthResponse, JobRecord, JobStatus,
-        MetricsResponse, QueueResponse, ReadinessResponse, SINGLE_TASK_PROMPTS, TaskSpec,
-        WorkerHealth,
+        CASCADED_TASK_PROMPTS, ErrorResponse, GpuMemoryResponse, HealthResponse, JobRecord,
+        JobStatus, MetricsResponse, QueueResponse, ReadinessResponse, SINGLE_TASK_PROMPTS,
+        TaskSpec, WorkerHealth,
     },
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
@@ -44,6 +45,7 @@ use crate::{
 pub fn router(state: AppState) -> Router {
     let cors_allowed_origins = state.config.cors_allowed_origins.clone();
     let request_timeout_seconds = state.config.request_timeout_seconds;
+    let state_for_middleware = state.clone();
     let mut router = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
@@ -55,7 +57,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/infer/path", post(submit_inference_path))
         .route("/v1/jobs/{id}", get(get_job))
         .layer(DefaultBodyLimit::max(state.config.body_limit_bytes))
-        .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware.clone(),
+            rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware.clone(),
+            require_api_key,
+        ))
         .with_state(state);
 
     if request_timeout_seconds > 0 {
@@ -71,7 +80,12 @@ pub fn router(state: AppState) -> Router {
         router.layer(cors_layer(&cors_allowed_origins))
     };
 
-    router.layer(middleware::from_fn(add_security_headers))
+    router
+        .layer(middleware::from_fn_with_state(
+            state_for_middleware,
+            track_request_metrics,
+        ))
+        .layer(middleware::from_fn(add_security_headers))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -184,10 +198,17 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
     let completed = metrics.jobs_succeeded + metrics.jobs_failed;
     let average_inference_ms =
         (completed > 0).then_some(metrics.total_inference_ms as f64 / completed as f64);
+    let average_request_ms = (metrics.http_requests_total > 0)
+        .then_some(metrics.total_request_ms as f64 / metrics.http_requests_total as f64);
+    let (process_memory_rss_bytes, gpu_memory) = system_usage().await;
 
     Json(MetricsResponse {
         workers,
         queued: state.queue_tx.len(),
+        http_requests_total: metrics.http_requests_total,
+        http_requests_failed: metrics.http_requests_failed,
+        total_request_ms: metrics.total_request_ms as u128,
+        average_request_ms,
         jobs_started: metrics.jobs_started,
         jobs_succeeded: metrics.jobs_succeeded,
         jobs_failed: metrics.jobs_failed,
@@ -196,7 +217,11 @@ async fn metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
         total_inference_ms: metrics.total_inference_ms as u128,
         average_inference_ms,
         model_load_ms: metrics.model_load_ms.map(|value| value as u128),
+        webhook_failures: metrics.webhook_failures,
+        cleanup_failures: metrics.cleanup_failures,
         retained_jobs: state.jobs.read().await.len(),
+        process_memory_rss_bytes,
+        gpu_memory,
     })
 }
 
@@ -452,7 +477,11 @@ async fn get_job(
     Ok(Json(record))
 }
 
-async fn log_request(request: Request, next: Next) -> Response {
+async fn track_request_metrics(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let version = request.version();
@@ -469,15 +498,115 @@ async fn log_request(request: Request, next: Next) -> Response {
     );
 
     let response = next.run(request).await;
+    let elapsed = started.elapsed();
+    let failed = response.status().is_client_error() || response.status().is_server_error();
+    state
+        .metrics
+        .record_http_request(elapsed.as_millis(), failed);
     info!(
         "http request finished method={} uri={} status={} elapsed_ms={}",
         method,
         uri,
         response.status(),
-        started.elapsed().as_millis()
+        elapsed.as_millis()
     );
 
     response
+}
+
+async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if is_probe_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    match state.rate_limiter.check() {
+        RateLimitDecision::Allowed => next.run(request).await,
+        RateLimitDecision::Limited { retry_after } => {
+            let mut response = json_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "request rate limit exceeded",
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            response
+        }
+    }
+}
+
+async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if state.config.api_keys.is_empty() || is_probe_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let presented = request_api_key(&request);
+    if presented
+        .as_deref()
+        .is_some_and(|key| api_key_allowed(key, &state.config.api_keys))
+    {
+        return next.run(request).await;
+    }
+
+    json_error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "valid API key is required",
+    )
+}
+
+fn is_probe_path(path: &str) -> bool {
+    matches!(path, "/health" | "/ready")
+}
+
+fn request_api_key(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(HeaderName::from_static("x-api-key"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| bearer_token(request))
+}
+
+fn bearer_token(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn api_key_allowed(presented: &str, configured: &[String]) -> bool {
+    configured
+        .iter()
+        .any(|expected| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+fn json_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            code: code.to_string(),
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 async fn add_security_headers(request: Request, next: Next) -> Response {
@@ -512,6 +641,69 @@ async fn add_security_headers(request: Request, next: Next) -> Response {
     );
 
     response
+}
+
+async fn system_usage() -> (Option<u64>, Option<GpuMemoryResponse>) {
+    let process_memory_rss_bytes = process_memory_rss_bytes();
+    let gpu_memory = gpu_memory_usage().await;
+    (process_memory_rss_bytes, gpu_memory)
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?.trim();
+        let kb = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(kb * 1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_rss_bytes() -> Option<u64> {
+    None
+}
+
+async fn gpu_memory_usage() -> Option<GpuMemoryResponse> {
+    let output = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_nvidia_smi_memory(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_nvidia_smi_memory(output: &str) -> Option<GpuMemoryResponse> {
+    let mut used_mib = 0_u64;
+    let mut total_mib = 0_u64;
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let (used, total) = line.split_once(',')?;
+        used_mib += used.trim().parse::<u64>().ok()?;
+        total_mib += total.trim().parse::<u64>().ok()?;
+    }
+
+    (total_mib > 0).then_some(GpuMemoryResponse {
+        used_bytes: used_mib * 1024 * 1024,
+        total_bytes: total_mib * 1024 * 1024,
+    })
 }
 
 fn task_spec_from_request(
@@ -730,10 +922,15 @@ fn openapi_document() -> Value {
             "title": "Florence-2 Base Inference Server",
             "version": env!("CARGO_PKG_VERSION"),
         },
+        "security": [
+            { "ApiKeyAuth": [] },
+            { "BearerAuth": [] }
+        ],
         "paths": {
             "/health": {
                 "get": {
                     "summary": "Liveness check",
+                    "security": [],
                     "responses": {
                         "200": {
                             "description": "Process is alive",
@@ -745,6 +942,7 @@ fn openapi_document() -> Value {
             "/ready": {
                 "get": {
                     "summary": "Readiness check",
+                    "security": [],
                     "responses": {
                         "200": { "description": "At least one worker is ready" },
                         "503": { "description": "No model worker is ready" }
@@ -758,7 +956,9 @@ fn openapi_document() -> Value {
                         "200": {
                             "description": "Metrics snapshot",
                             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetricsResponse" } } }
-                        }
+                        },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "429": { "$ref": "#/components/responses/RateLimited" }
                     }
                 }
             },
@@ -772,6 +972,8 @@ fn openapi_document() -> Value {
                     "responses": {
                         "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
                         "400": { "$ref": "#/components/responses/BadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "429": { "$ref": "#/components/responses/RateLimited" },
                         "503": { "$ref": "#/components/responses/ServiceUnavailable" }
                     }
                 }
@@ -786,7 +988,9 @@ fn openapi_document() -> Value {
                     "responses": {
                         "200": { "description": "Job queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueueResponse" } } } },
                         "400": { "$ref": "#/components/responses/BadRequest" },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
                         "403": { "$ref": "#/components/responses/Forbidden" },
+                        "429": { "$ref": "#/components/responses/RateLimited" },
                         "503": { "$ref": "#/components/responses/ServiceUnavailable" }
                     }
                 }
@@ -802,6 +1006,8 @@ fn openapi_document() -> Value {
                     }],
                     "responses": {
                         "200": { "description": "Job record", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobRecord" } } } },
+                        "401": { "$ref": "#/components/responses/Unauthorized" },
+                        "429": { "$ref": "#/components/responses/RateLimited" },
                         "404": { "$ref": "#/components/responses/NotFound" }
                     }
                 }
@@ -811,8 +1017,21 @@ fn openapi_document() -> Value {
             "responses": {
                 "BadRequest": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
                 "Forbidden": { "description": "Forbidden", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "Unauthorized": { "description": "API key is missing or invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "RateLimited": { "description": "Request rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
                 "NotFound": { "description": "Not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
                 "ServiceUnavailable": { "description": "Service unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+            },
+            "securitySchemes": {
+                "ApiKeyAuth": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "x-api-key"
+                },
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer"
+                }
             },
             "schemas": {
                 "ErrorResponse": {
@@ -887,7 +1106,11 @@ fn cors_layer(allowed_origins: &[String]) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-api-key"),
+        ])
 }
 
 #[cfg(test)]
@@ -902,7 +1125,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, ModelVariant},
-        state::{AppMetrics, WorkerPoolState},
+        state::{AppMetrics, RateLimiter, WorkerPoolState},
         types::{TaskPrompt, TaskType},
     };
 
@@ -1081,6 +1304,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_key_auth_is_disabled_without_configured_keys() {
+        let state = test_state(false, Vec::new());
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_rejects_missing_key_when_enabled() {
+        let mut state = test_state(false, Vec::new());
+        Arc::get_mut(&mut state.config).unwrap().api_keys = vec!["secret".to_string()];
+        let metrics = Arc::clone(&state.metrics);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.http_requests_total, 1);
+        assert_eq!(snapshot.http_requests_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_accepts_x_api_key() {
+        let mut state = test_state(false, Vec::new());
+        Arc::get_mut(&mut state.config).unwrap().api_keys = vec!["secret".to_string()];
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .header("x-api-key", "secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejects_after_configured_limit() {
+        let mut state = test_state(false, Vec::new());
+        Arc::get_mut(&mut state.config)
+            .unwrap()
+            .rate_limit_requests_per_minute = 1;
+        state.rate_limiter = Arc::new(RateLimiter::new(1));
+        let app = router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
+    fn parses_nvidia_smi_memory_totals() {
+        let memory = parse_nvidia_smi_memory("100, 1000\n25, 500\n").unwrap();
+
+        assert_eq!(memory.used_bytes, 125 * 1024 * 1024);
+        assert_eq!(memory.total_bytes, 1500 * 1024 * 1024);
+    }
+
+    #[tokio::test]
     async fn request_timeout_layer_returns_408() {
         let app = Router::new()
             .route(
@@ -1177,6 +1503,8 @@ mod tests {
                 allow_local_paths,
                 local_path_roots,
                 cors_allowed_origins: Vec::new(),
+                api_keys: Vec::new(),
+                rate_limit_requests_per_minute: 0,
                 job_retention_limit: 1000,
                 metadata_retention_limit: 10_000,
                 max_image_width: 8192,
@@ -1190,6 +1518,12 @@ mod tests {
                 job_timeout_seconds: 300,
                 webhook_timeout_seconds: 10,
                 webhook_connect_timeout_seconds: 5,
+                webhook_max_attempts: 1,
+                webhook_initial_backoff_ms: 500,
+                webhook_signing_secret: None,
+                webhooks_dead_letter_jsonl: PathBuf::from(
+                    "data/metadata/webhooks_dead_letter.jsonl",
+                ),
                 allow_private_webhook_urls: false,
                 execution_providers: vec!["cpu".to_string()],
             }),
@@ -1197,6 +1531,7 @@ mod tests {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(WorkerPoolState::new(1)),
             metrics: Arc::new(AppMetrics::default()),
+            rate_limiter: Arc::new(RateLimiter::new(0)),
         }
     }
 

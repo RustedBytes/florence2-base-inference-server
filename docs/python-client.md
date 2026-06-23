@@ -14,6 +14,14 @@ Submit an image upload and wait for the final result:
 python3 examples/python_client.py upload /path/to/image.png
 ```
 
+If API key authentication is enabled:
+
+```bash
+python3 examples/python_client.py \
+  --api-key replace-with-a-long-random-secret \
+  upload /path/to/image.png
+```
+
 Submit a server-side image path:
 
 ```bash

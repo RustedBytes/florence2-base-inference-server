@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, anyhow};
 use async_channel::Receiver;
 use log::{debug, error, info, warn};
+use serde::Serialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -17,7 +18,7 @@ use crate::{
     inference::FlorenceWorker,
     state::{AppMetrics, AppState, WorkerPoolState},
     types::{InferenceMetadata, JobRecord, JobStatus, QueueResponse, TaskSpec},
-    util::append_jsonl,
+    util::{append_jsonl, hmac_sha256_hex},
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,10 @@ pub struct JobRequest {
 #[derive(Clone)]
 pub struct WebhookClient {
     http: reqwest::Client,
+    max_attempts: usize,
+    initial_backoff: Duration,
+    signing_secret: Option<String>,
+    dead_letter_jsonl: PathBuf,
 }
 
 impl WebhookClient {
@@ -37,10 +42,21 @@ impl WebhookClient {
         Self::new(
             config.webhook_timeout_seconds,
             config.webhook_connect_timeout_seconds,
+            config.webhook_max_attempts,
+            Duration::from_millis(config.webhook_initial_backoff_ms),
+            config.webhook_signing_secret.clone(),
+            config.webhooks_dead_letter_jsonl.clone(),
         )
     }
 
-    fn new(timeout_seconds: u64, connect_timeout_seconds: u64) -> anyhow::Result<Self> {
+    fn new(
+        timeout_seconds: u64,
+        connect_timeout_seconds: u64,
+        max_attempts: usize,
+        initial_backoff: Duration,
+        signing_secret: Option<String>,
+        dead_letter_jsonl: PathBuf,
+    ) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         if timeout_seconds > 0 {
             builder = builder.timeout(Duration::from_secs(timeout_seconds));
@@ -53,19 +69,39 @@ impl WebhookClient {
             .build()
             .context("failed to build webhook HTTP client")?;
 
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            max_attempts: max_attempts.max(1),
+            initial_backoff,
+            signing_secret,
+            dead_letter_jsonl,
+        })
     }
 
-    async fn send(&self, record: &JobRecord) -> anyhow::Result<()> {
+    async fn send(&self, event: &WebhookEvent, attempt: usize) -> anyhow::Result<()> {
+        let record = &event.job;
         let Some(webhook_url) = record.webhook_url.as_deref() else {
             return Ok(());
         };
         let redacted_url = redacted_webhook_url(webhook_url);
+        let body = serde_json::to_vec(event).context("failed to serialize webhook event")?;
 
-        let response = self
+        let mut request = self
             .http
             .post(webhook_url)
-            .json(record)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-florence-event-id", event.event_id.to_string())
+            .header("x-florence-event-type", event.event_type)
+            .header("x-florence-delivery-attempt", attempt.to_string())
+            .body(body.clone());
+        if let Some(secret) = &self.signing_secret {
+            request = request.header(
+                "x-florence-signature",
+                format!("sha256={}", hmac_sha256_hex(secret, &body)),
+            );
+        }
+
+        let response = request
             .send()
             .await
             .with_context(|| format!("failed to send webhook request to {redacted_url}"))?;
@@ -79,6 +115,101 @@ impl WebhookClient {
 
         Ok(())
     }
+
+    async fn deliver(&self, record: &JobRecord) -> WebhookDeliveryResult {
+        if record.webhook_url.is_none() {
+            return WebhookDeliveryResult::Skipped;
+        }
+
+        let event = WebhookEvent::from_job(record.clone());
+        let mut last_error = None;
+
+        for attempt in 1..=self.max_attempts {
+            match self.send(&event, attempt).await {
+                Ok(()) => {
+                    return WebhookDeliveryResult::Delivered {
+                        event_id: event.event_id,
+                        attempts: attempt,
+                    };
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    if attempt < self.max_attempts && !self.initial_backoff.is_zero() {
+                        tokio::time::sleep(backoff_delay(self.initial_backoff, attempt)).await;
+                    }
+                }
+            }
+        }
+
+        let error = last_error.unwrap_or_else(|| "webhook delivery failed".to_string());
+        let dead_letter = WebhookDeadLetter {
+            event,
+            attempts: self.max_attempts,
+            failed_at: time::OffsetDateTime::now_utc(),
+            error: error.clone(),
+        };
+        match append_jsonl(&self.dead_letter_jsonl, &dead_letter).await {
+            Ok(()) => WebhookDeliveryResult::Failed {
+                event_id: dead_letter.event.event_id,
+                attempts: dead_letter.attempts,
+                error,
+            },
+            Err(err) => WebhookDeliveryResult::DeadLetterFailed {
+                event_id: dead_letter.event.event_id,
+                attempts: dead_letter.attempts,
+                error,
+                dead_letter_error: err.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookEvent {
+    pub event_id: Uuid,
+    pub event_type: &'static str,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    pub job: JobRecord,
+}
+
+impl WebhookEvent {
+    fn from_job(job: JobRecord) -> Self {
+        Self {
+            event_id: Uuid::new_v4(),
+            event_type: "job.completed",
+            created_at: time::OffsetDateTime::now_utc(),
+            job,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebhookDeadLetter {
+    pub event: WebhookEvent,
+    pub attempts: usize,
+    #[serde(with = "time::serde::rfc3339")]
+    pub failed_at: time::OffsetDateTime,
+    pub error: String,
+}
+
+enum WebhookDeliveryResult {
+    Skipped,
+    Delivered {
+        event_id: Uuid,
+        attempts: usize,
+    },
+    Failed {
+        event_id: Uuid,
+        attempts: usize,
+        error: String,
+    },
+    DeadLetterFailed {
+        event_id: Uuid,
+        attempts: usize,
+        error: String,
+        dead_letter_error: String,
+    },
 }
 
 pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecord>> {
@@ -365,13 +496,28 @@ pub fn start_workers(
                             Ok((_, returned_worker, Ok(metadata))) => {
                                 worker = returned_worker;
                                 metrics.record_job_succeeded(elapsed_ms);
-                                finish_job(&config, &jobs, &webhooks, request.id, Ok(metadata))
-                                    .await;
+                                finish_job(
+                                    &config,
+                                    &jobs,
+                                    &metrics,
+                                    &webhooks,
+                                    request.id,
+                                    Ok(metadata),
+                                )
+                                .await;
                             }
                             Ok((_, returned_worker, Err(err))) => {
                                 worker = returned_worker;
                                 metrics.record_job_failed(elapsed_ms);
-                                finish_job(&config, &jobs, &webhooks, request.id, Err(err)).await;
+                                finish_job(
+                                    &config,
+                                    &jobs,
+                                    &metrics,
+                                    &webhooks,
+                                    request.id,
+                                    Err(err),
+                                )
+                                .await;
                             }
                             Err(err) => {
                                 metrics.record_job_failed(elapsed_ms);
@@ -379,6 +525,7 @@ pub fn start_workers(
                                 finish_job(
                                     &config,
                                     &jobs,
+                                    &metrics,
                                     &webhooks,
                                     request.id,
                                     Err(anyhow!("worker task failed: {err}")),
@@ -394,6 +541,7 @@ pub fn start_workers(
                             finish_job(
                                 &config,
                                 &jobs,
+                                &metrics,
                                 &webhooks,
                                 request.id,
                                 Err(anyhow!(
@@ -498,6 +646,7 @@ async fn mark_running(jobs: &RwLock<HashMap<Uuid, JobRecord>>, id: Uuid) {
 async fn finish_job(
     config: &Config,
     jobs: &RwLock<HashMap<Uuid, JobRecord>>,
+    metrics: &AppMetrics,
     webhooks: &WebhookClient,
     id: Uuid,
     result: anyhow::Result<InferenceMetadata>,
@@ -539,8 +688,8 @@ async fn finish_job(
                 config.results_jsonl.display()
             );
         }
-        send_webhook(webhooks, &record).await;
-        cleanup_job_artifacts(config, &record).await;
+        send_webhook(metrics, webhooks, &record).await;
+        cleanup_job_artifacts(config, metrics, &record).await;
         {
             let mut jobs = jobs.write().await;
             retain_recent_jobs(&mut jobs, config.job_retention_limit);
@@ -550,21 +699,41 @@ async fn finish_job(
     }
 }
 
-async fn send_webhook(webhooks: &WebhookClient, record: &JobRecord) {
+async fn send_webhook(metrics: &AppMetrics, webhooks: &WebhookClient, record: &JobRecord) {
     let Some(webhook_url) = record.webhook_url.as_deref() else {
         return;
     };
     let redacted_url = redacted_webhook_url(webhook_url);
 
-    match webhooks.send(record).await {
-        Ok(()) => info!(
-            "webhook delivered job_id={} url={}",
-            record.id, redacted_url
+    match webhooks.deliver(record).await {
+        WebhookDeliveryResult::Skipped => {}
+        WebhookDeliveryResult::Delivered { event_id, attempts } => info!(
+            "webhook delivered job_id={} event_id={} url={} attempts={}",
+            record.id, event_id, redacted_url, attempts
         ),
-        Err(err) => warn!(
-            "webhook delivery failed job_id={} url={} error={}",
-            record.id, redacted_url, err
-        ),
+        WebhookDeliveryResult::Failed {
+            event_id,
+            attempts,
+            error,
+        } => {
+            metrics.record_webhook_failure();
+            warn!(
+                "webhook delivery failed job_id={} event_id={} url={} attempts={} error={}",
+                record.id, event_id, redacted_url, attempts, error
+            );
+        }
+        WebhookDeliveryResult::DeadLetterFailed {
+            event_id,
+            attempts,
+            error,
+            dead_letter_error,
+        } => {
+            metrics.record_webhook_failure();
+            warn!(
+                "webhook delivery failed and dead-letter append failed job_id={} event_id={} url={} attempts={} error={} dead_letter_error={}",
+                record.id, event_id, redacted_url, attempts, error, dead_letter_error
+            );
+        }
     }
 }
 
@@ -579,7 +748,7 @@ fn redacted_webhook_url(webhook_url: &str) -> String {
     url.to_string()
 }
 
-async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
+async fn cleanup_job_artifacts(config: &Config, metrics: &AppMetrics, record: &JobRecord) {
     if !should_delete_image(config, record) {
         return;
     }
@@ -600,6 +769,7 @@ async fn cleanup_job_artifacts(config: &Config, record: &JobRecord) {
             );
         }
         Err(err) => {
+            metrics.record_cleanup_failure();
             warn!(
                 "failed to clean up uploaded image job_id={} path={} error={}",
                 record.id,
@@ -618,6 +788,11 @@ fn path_is_inside(path: &Path, directory: &Path) -> bool {
     path.starts_with(directory) && path != directory
 }
 
+fn backoff_delay(initial_backoff: Duration, attempt: usize) -> Duration {
+    let multiplier = 1_u32.checked_shl((attempt - 1).min(16) as u32).unwrap_or(1);
+    initial_backoff.saturating_mul(multiplier)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -629,7 +804,7 @@ mod tests {
     use super::*;
     use crate::{
         config::ModelVariant,
-        state::{AppMetrics, WorkerPoolState},
+        state::{AppMetrics, RateLimiter, WorkerPoolState},
     };
 
     fn test_config() -> Config {
@@ -645,6 +820,8 @@ mod tests {
             allow_local_paths: false,
             local_path_roots: Vec::new(),
             cors_allowed_origins: Vec::new(),
+            api_keys: Vec::new(),
+            rate_limit_requests_per_minute: 0,
             job_retention_limit: 1000,
             metadata_retention_limit: 10_000,
             max_image_width: 8192,
@@ -658,6 +835,10 @@ mod tests {
             job_timeout_seconds: 300,
             webhook_timeout_seconds: 10,
             webhook_connect_timeout_seconds: 5,
+            webhook_max_attempts: 1,
+            webhook_initial_backoff_ms: 500,
+            webhook_signing_secret: None,
+            webhooks_dead_letter_jsonl: PathBuf::from("data/metadata/webhooks_dead_letter.jsonl"),
             allow_private_webhook_urls: false,
             execution_providers: vec!["cpu".to_string()],
         }
@@ -699,6 +880,7 @@ mod tests {
         config.metadata_dir = dir.join("metadata");
         config.submissions_jsonl = config.metadata_dir.join("submissions.jsonl");
         config.results_jsonl = config.metadata_dir.join("results.jsonl");
+        config.webhooks_dead_letter_jsonl = config.metadata_dir.join("webhooks_dead_letter.jsonl");
         config
     }
 
@@ -791,6 +973,7 @@ mod tests {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(WorkerPoolState::new(1)),
             metrics: Arc::new(AppMetrics::default()),
+            rate_limiter: Arc::new(RateLimiter::new(0)),
         };
         let record = job_record("upload", config.images_dir.join("job.png"));
         let err = enqueue_record(&state, record.clone()).await.unwrap_err();
@@ -810,11 +993,18 @@ mod tests {
         record.id = Uuid::new_v4();
         record.webhook_url = Some(url.clone());
 
-        WebhookClient::new(10, 5)
-            .unwrap()
-            .send(&record)
-            .await
-            .unwrap();
+        WebhookClient::new(
+            10,
+            5,
+            1,
+            Duration::from_millis(1),
+            Some("secret".to_string()),
+            std::env::temp_dir().join("unused-webhook-dead-letter.jsonl"),
+        )
+        .unwrap()
+        .send(&WebhookEvent::from_job(record.clone()), 1)
+        .await
+        .unwrap();
 
         let request = server.await.unwrap();
         let request = String::from_utf8(request).unwrap();
@@ -822,9 +1012,13 @@ mod tests {
         let body = serde_json::from_str::<serde_json::Value>(body).unwrap();
 
         assert!(request.starts_with("POST /hook HTTP/1.1"));
-        assert_eq!(body["id"], record.id.to_string());
-        assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["webhook_url"], url);
+        assert_eq!(body["event_type"], "job.completed");
+        assert_eq!(body["job"]["id"], record.id.to_string());
+        assert_eq!(body["job"]["status"], "succeeded");
+        assert_eq!(body["job"]["webhook_url"], url);
+        assert!(request.contains("x-florence-event-id:"));
+        assert!(request.contains("x-florence-delivery-attempt: 1"));
+        assert!(request.contains("x-florence-signature: sha256="));
     }
 
     #[test]
@@ -846,10 +1040,20 @@ mod tests {
         let id = record.id;
         let jobs = RwLock::new(HashMap::from([(id, record)]));
 
-        let webhooks = WebhookClient::new(10, 5).unwrap();
+        let metrics = AppMetrics::default();
+        let webhooks = WebhookClient::new(
+            10,
+            5,
+            1,
+            Duration::from_millis(1),
+            None,
+            config.webhooks_dead_letter_jsonl.clone(),
+        )
+        .unwrap();
         finish_job(
             &config,
             &jobs,
+            &metrics,
             &webhooks,
             id,
             Err(anyhow!("inference failed")),
@@ -861,9 +1065,81 @@ mod tests {
         let (_, body) = request.split_once("\r\n\r\n").unwrap();
         let body = serde_json::from_str::<serde_json::Value>(body).unwrap();
 
-        assert_eq!(body["id"], id.to_string());
-        assert_eq!(body["status"], "failed");
-        assert_eq!(body["error"], "inference failed");
+        assert_eq!(body["job"]["id"], id.to_string());
+        assert_eq!(body["job"]["status"], "failed");
+        assert_eq!(body["job"]["error"], "inference failed");
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_retries_with_same_event_id() {
+        let config = temp_config("webhook-retry");
+        let (url, server) =
+            spawn_webhook_status_sequence(["500 Internal Server Error", "204 No Content"]).await;
+        let mut record = job_record("upload", config.images_dir.join("job.png"));
+        record.id = Uuid::new_v4();
+        record.webhook_url = Some(url);
+        let webhooks = WebhookClient::new(
+            10,
+            5,
+            2,
+            Duration::from_millis(1),
+            None,
+            config.webhooks_dead_letter_jsonl.clone(),
+        )
+        .unwrap();
+
+        let result = webhooks.deliver(&record).await;
+        let requests = server.await.unwrap();
+
+        assert!(matches!(
+            result,
+            WebhookDeliveryResult::Delivered { attempts: 2, .. }
+        ));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_value(&requests[0], "x-florence-event-id"),
+            header_value(&requests[1], "x-florence-event-id")
+        );
+        assert!(!config.webhooks_dead_letter_jsonl.exists());
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_writes_dead_letter_after_final_failure() {
+        let config = temp_config("webhook-dead-letter");
+        let (url, server) = spawn_webhook_status_sequence([
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+        ])
+        .await;
+        let mut record = job_record("upload", config.images_dir.join("job.png"));
+        record.id = Uuid::new_v4();
+        record.webhook_url = Some(url);
+        let webhooks = WebhookClient::new(
+            10,
+            5,
+            2,
+            Duration::from_millis(1),
+            None,
+            config.webhooks_dead_letter_jsonl.clone(),
+        )
+        .unwrap();
+
+        let result = webhooks.deliver(&record).await;
+        let requests = server.await.unwrap();
+        let dead_letter = std::fs::read_to_string(&config.webhooks_dead_letter_jsonl).unwrap();
+
+        assert!(matches!(
+            result,
+            WebhookDeliveryResult::Failed { attempts: 2, .. }
+        ));
+        assert_eq!(requests.len(), 2);
+        assert!(dead_letter.contains("\"attempts\":2"));
+        assert!(dead_letter.contains(&record.id.to_string()));
+        assert!(dead_letter.contains("webhook endpoint returned HTTP 500"));
 
         std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
@@ -894,6 +1170,47 @@ mod tests {
         });
 
         (url, server)
+    }
+
+    async fn spawn_webhook_status_sequence<const N: usize>(
+        statuses: [&'static str; N],
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+
+                loop {
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0, "client closed before sending full request");
+                    request.extend_from_slice(&buffer[..n]);
+
+                    if request_is_complete(&request) {
+                        break;
+                    }
+                }
+
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                stream.write_all(response.as_bytes()).await.unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+
+        (url, server)
+    }
+
+    fn header_value(request: &[u8], name: &str) -> Option<String> {
+        let headers = String::from_utf8_lossy(request);
+        headers
+            .lines()
+            .find_map(|line| line.split_once(':'))
+            .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
     }
 
     fn request_is_complete(request: &[u8]) -> bool {
