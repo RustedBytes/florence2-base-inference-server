@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::config::ModelVariant;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
@@ -329,10 +329,26 @@ pub struct QueueResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-    pub workers: usize,
+    pub ready: bool,
+    pub workers: WorkerHealth,
     pub queued: usize,
     pub model_path: PathBuf,
     pub model_variant: ModelVariant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessResponse {
+    pub status: &'static str,
+    pub ready: bool,
+    pub workers: WorkerHealth,
+    pub queued: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHealth {
+    pub expected: usize,
+    pub ready: usize,
+    pub failed: usize,
 }
 
 #[cfg(test)]

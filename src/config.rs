@@ -24,6 +24,8 @@ pub struct Config {
     pub metadata_dir: PathBuf,
     pub submissions_jsonl: PathBuf,
     pub results_jsonl: PathBuf,
+    pub allow_local_paths: bool,
+    pub local_path_roots: Vec<PathBuf>,
     pub workers: usize,
     pub queue_size: usize,
     pub body_limit_bytes: usize,
@@ -44,6 +46,13 @@ impl Config {
 
         let data_dir = path_setting("DATA_DIR", server.data_dir, DEFAULT_DATA_DIR);
         let metadata_dir = data_dir.join("metadata");
+        let allow_local_paths = bool_setting("ALLOW_LOCAL_PATHS", server.allow_local_paths, false)?;
+        let local_path_roots = path_list_setting("LOCAL_PATH_ROOTS", server.local_path_roots);
+        if allow_local_paths && local_path_roots.is_empty() {
+            return Err(anyhow!(
+                "local path inference requires at least one configured local_path_roots entry"
+            ));
+        }
         let model_path_override = env_path("MODEL_PATH").or(model.path);
         let model_variant = parse_model_variant(model.variant, model_path_override.is_some())?;
         let model_path = model_path_override.unwrap_or_else(|| model_variant.default_model_path());
@@ -58,6 +67,8 @@ impl Config {
             images_dir: data_dir.join("images"),
             submissions_jsonl: metadata_dir.join("submissions.jsonl"),
             results_jsonl: metadata_dir.join("results.jsonl"),
+            allow_local_paths,
+            local_path_roots,
             metadata_dir,
             data_dir,
             workers: usize_setting(
@@ -145,6 +156,8 @@ impl FileConfig {
 struct ServerConfig {
     bind_addr: Option<String>,
     data_dir: Option<PathBuf>,
+    allow_local_paths: Option<bool>,
+    local_path_roots: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +261,30 @@ fn usize_setting(key: &str, file_value: Option<usize>, default: usize) -> anyhow
             .map_err(|err| anyhow!("{key} has invalid value `{value}`: {err}")),
         Err(_) => Ok(file_value.unwrap_or(default)),
     }
+}
+
+fn bool_setting(key: &str, file_value: Option<bool>, default: bool) -> anyhow::Result<bool> {
+    match env::var(key) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(anyhow!(
+                "{key} has invalid value `{value}`; expected true or false"
+            )),
+        },
+        Err(_) => Ok(file_value.unwrap_or(default)),
+    }
+}
+
+fn path_list_setting(key: &str, file_value: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
+    env::var_os(key)
+        .map(|value| {
+            env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .or(file_value)
+        .unwrap_or_default()
 }
 
 fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {

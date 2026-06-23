@@ -18,12 +18,12 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    jobs::enqueue_record,
+    jobs::{EnqueueError, enqueue_record},
     state::AppState,
     templates::IndexTemplate,
     types::{
         CASCADED_TASK_PROMPTS, HealthResponse, JobRecord, JobStatus, QueueResponse,
-        SINGLE_TASK_PROMPTS, TaskSpec,
+        ReadinessResponse, SINGLE_TASK_PROMPTS, TaskSpec, WorkerHealth,
     },
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
@@ -32,6 +32,7 @@ pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/v1/infer", post(submit_inference))
         .route("/infer-form", post(submit_inference_form))
         .route("/v1/infer/path", post(submit_inference_path))
@@ -52,6 +53,10 @@ pub enum ApiError {
     BadRequest(String),
     #[error("job not found")]
     NotFound,
+    #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -61,6 +66,8 @@ impl IntoResponse for ApiError {
         let status = match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(ErrorBody {
@@ -90,9 +97,13 @@ async fn index() -> Result<Html<String>, ApiError> {
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let workers = worker_health(&state);
     debug!(
-        "health check workers={} queued={} model_path={} model_variant={}",
-        state.config.workers,
+        "health check worker_ready={} workers={} ready_workers={} failed_workers={} queued={} model_path={} model_variant={}",
+        workers.ready > 0,
+        workers.expected,
+        workers.ready,
+        workers.failed,
         state.queue_tx.len(),
         state.config.model_path.display(),
         state.config.model_variant.as_str()
@@ -100,11 +111,30 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
     Json(HealthResponse {
         status: "ok",
-        workers: state.config.workers,
+        ready: workers.ready > 0,
+        workers,
         queued: state.queue_tx.len(),
         model_path: state.config.model_path.clone(),
         model_variant: state.config.model_variant,
     })
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    let workers = worker_health(&state);
+    let ready = workers.ready > 0;
+    let response = ReadinessResponse {
+        status: if ready { "ready" } else { "not_ready" },
+        ready,
+        workers,
+        queued: state.queue_tx.len(),
+    };
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status, Json(response)).into_response()
 }
 
 async fn submit_inference(
@@ -129,6 +159,7 @@ async fn submit_multipart_job(
     mut multipart: Multipart,
 ) -> Result<QueueResponse, ApiError> {
     debug!("multipart inference submission started");
+    ensure_workers_ready(state)?;
 
     let mut image: Option<UploadedImage> = None;
     let mut task_type: Option<String> = None;
@@ -230,6 +261,7 @@ async fn submit_inference_path(
     State(state): State<AppState>,
     Json(request): Json<LocalPathRequest>,
 ) -> Result<Json<QueueResponse>, ApiError> {
+    ensure_workers_ready(&state)?;
     debug!(
         "local path inference submission started image_path={}",
         request.image_path.display()
@@ -245,6 +277,7 @@ async fn submit_inference_path(
             request.image_path.display()
         ))
     })?;
+    ensure_local_path_allowed(&state, &image_path).await?;
     let metadata = fs::metadata(&image_path).await.map_err(|err| {
         ApiError::BadRequest(format!(
             "failed to inspect image path {}: {err}",
@@ -313,6 +346,21 @@ async fn submit_inference_path(
     };
 
     Ok(Json(enqueue_record(&state, record).await?))
+}
+
+impl From<EnqueueError> for ApiError {
+    fn from(err: EnqueueError) -> Self {
+        match err {
+            EnqueueError::InvalidTask(source) => ApiError::BadRequest(source.to_string()),
+            EnqueueError::QueueFull => {
+                ApiError::ServiceUnavailable("inference queue is full".to_string())
+            }
+            EnqueueError::QueueClosed => {
+                ApiError::ServiceUnavailable("inference queue is closed".to_string())
+            }
+            EnqueueError::Persist(source) => ApiError::Internal(source),
+        }
+    }
 }
 
 async fn get_job(
@@ -387,10 +435,68 @@ fn render_index(
     })
 }
 
+fn ensure_workers_ready(state: &AppState) -> Result<(), ApiError> {
+    if state.workers.is_ready() {
+        Ok(())
+    } else {
+        Err(ApiError::ServiceUnavailable(
+            "model workers are not ready".to_string(),
+        ))
+    }
+}
+
+async fn ensure_local_path_allowed(
+    state: &AppState,
+    image_path: &std::path::Path,
+) -> Result<(), ApiError> {
+    if !state.config.allow_local_paths {
+        return Err(ApiError::Forbidden(
+            "local path inference is disabled".to_string(),
+        ));
+    }
+
+    for root in &state.config.local_path_roots {
+        match fs::canonicalize(root).await {
+            Ok(root) if image_path.starts_with(&root) && image_path != root => return Ok(()),
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    "configured local path root could not be resolved root={} error={}",
+                    root.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    Err(ApiError::Forbidden(format!(
+        "image path is outside configured local path roots: {}",
+        image_path.display()
+    )))
+}
+
+fn worker_health(state: &AppState) -> WorkerHealth {
+    let snapshot = state.workers.snapshot();
+    WorkerHealth {
+        expected: snapshot.expected,
+        ready: snapshot.ready,
+        failed: snapshot.failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+
+    use async_channel::bounded;
+    use tokio::sync::RwLock;
+
     use super::*;
-    use crate::types::{TaskPrompt, TaskType};
+    use crate::{
+        config::{Config, ModelVariant},
+        state::WorkerPoolState,
+        types::{TaskPrompt, TaskType},
+    };
 
     #[test]
     fn request_task_defaults_to_single_caption() {
@@ -455,5 +561,63 @@ mod tests {
         assert!(html.contains("OCR with Region"));
         assert!(html.contains("Caption + Grounding"));
         assert!(html.contains("bad request"));
+    }
+
+    #[tokio::test]
+    async fn local_path_endpoint_is_disabled_by_default() {
+        let state = test_state(false, Vec::new());
+        let path = std::env::temp_dir().join(format!("florence2-api-test-{}", Uuid::new_v4()));
+        tokio::fs::write(&path, b"image").await.unwrap();
+        let path = tokio::fs::canonicalize(&path).await.unwrap();
+
+        let err = ensure_local_path_allowed(&state, &path).await.unwrap_err();
+
+        assert!(matches!(err, ApiError::Forbidden(_)));
+        assert!(err.to_string().contains("local path inference is disabled"));
+
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_path_endpoint_allows_files_under_configured_roots() {
+        let root = std::env::temp_dir().join(format!("florence2-api-root-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let image_path = root.join("image.bin");
+        tokio::fs::write(&image_path, b"image").await.unwrap();
+        let image_path = tokio::fs::canonicalize(&image_path).await.unwrap();
+        let state = test_state(true, vec![root.clone()]);
+
+        ensure_local_path_allowed(&state, &image_path)
+            .await
+            .unwrap();
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    fn test_state(allow_local_paths: bool, local_path_roots: Vec<PathBuf>) -> AppState {
+        let (queue_tx, _queue_rx) = bounded(1);
+        AppState {
+            config: Arc::new(Config {
+                addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
+                model_path: PathBuf::from("Florence-2-base/onnx/vision_encoder.onnx"),
+                model_variant: ModelVariant::Fp32,
+                data_dir: PathBuf::from("data"),
+                images_dir: PathBuf::from("data/images"),
+                metadata_dir: PathBuf::from("data/metadata"),
+                submissions_jsonl: PathBuf::from("data/metadata/submissions.jsonl"),
+                results_jsonl: PathBuf::from("data/metadata/results.jsonl"),
+                allow_local_paths,
+                local_path_roots,
+                workers: 1,
+                queue_size: 1,
+                body_limit_bytes: 1024,
+                rust_log: "info".to_string(),
+                max_new_tokens: 1,
+                execution_providers: vec!["cpu".to_string()],
+            }),
+            queue_tx,
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            workers: Arc::new(WorkerPoolState::new(1)),
+        }
     }
 }

@@ -30,6 +30,10 @@ const HIDDEN_SIZE: i64 = 768;
 const DECODER_START_TOKEN_ID: i64 = 2;
 const EOS_TOKEN_ID: i64 = 2;
 
+pub fn validate_model_artifacts(model_path: &Path, variant: ModelVariant) -> anyhow::Result<()> {
+    FlorenceModelPaths::from_vision_path(model_path, variant).ensure_exists()
+}
+
 pub struct FlorenceWorker {
     id: usize,
     model_paths: FlorenceModelPaths,

@@ -2,6 +2,10 @@
 bind_addr = "127.0.0.1:3000"
 data_dir = "data"
 
+# Disabled by default. Enable only for trusted deployments and restrict roots.
+allow_local_paths = false
+local_path_roots = []
+
 [model]
 # Supported variants: fp32, fp16, int8, uint8, quantized, q4, q4f16, bnb4, custom
 variant = "fp16"

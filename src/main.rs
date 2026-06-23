@@ -7,16 +7,20 @@ mod templates;
 mod types;
 mod util;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
 use env_logger::Env;
 use log::{debug, info};
-use state::AppState;
+use state::{AppState, WorkerPoolState};
 use tokio::sync::RwLock;
 
-use crate::{config::Config, jobs::start_workers};
+use crate::{
+    config::Config,
+    inference::validate_model_artifacts,
+    jobs::{load_jobs, start_workers},
+};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -36,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     config.ensure_dirs().await?;
+    validate_model_artifacts(&config.model_path, config.model_variant)?;
     debug!(
         "config loaded addr={} model_path={} model_variant={} data_dir={} images_dir={} metadata_dir={} workers={} queue_size={} body_limit_bytes={} max_new_tokens={} execution_providers={:?} rust_log={}",
         config.addr,
@@ -53,13 +58,21 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (queue_tx, queue_rx) = async_channel::bounded(config.queue_size);
+    let jobs = load_jobs(&config).await?;
+    let workers = Arc::new(WorkerPoolState::new(config.workers));
     let state = AppState {
         config: Arc::clone(&config),
         queue_tx,
-        jobs: Arc::new(RwLock::new(HashMap::new())),
+        jobs: Arc::new(RwLock::new(jobs)),
+        workers: Arc::clone(&workers),
     };
 
-    start_workers(Arc::clone(&config), Arc::clone(&state.jobs), queue_rx);
+    start_workers(
+        Arc::clone(&config),
+        Arc::clone(&state.jobs),
+        workers,
+        queue_rx,
+    );
 
     let app = api::router(state, config.body_limit_bytes);
     let listener = tokio::net::TcpListener::bind(config.addr)

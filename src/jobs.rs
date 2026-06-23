@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     inference::FlorenceWorker,
-    state::AppState,
+    state::{AppState, WorkerPoolState},
     types::{InferenceMetadata, JobRecord, JobStatus, QueueResponse, TaskSpec},
     util::append_jsonl,
 };
@@ -26,7 +26,77 @@ pub struct JobRequest {
     pub task: TaskSpec,
 }
 
-pub async fn enqueue_record(state: &AppState, record: JobRecord) -> anyhow::Result<QueueResponse> {
+pub async fn load_jobs(config: &Config) -> anyhow::Result<HashMap<Uuid, JobRecord>> {
+    let mut jobs = HashMap::new();
+    load_job_records(&config.submissions_jsonl, &mut jobs).await?;
+    load_job_records(&config.results_jsonl, &mut jobs).await?;
+
+    let mut recovered = Vec::new();
+    for record in jobs.values_mut() {
+        if matches!(record.status, JobStatus::Queued | JobStatus::Running) {
+            record.status = JobStatus::Failed;
+            record.updated_at = time::OffsetDateTime::now_utc();
+            record.error = Some("server restarted before job reached a terminal state".to_string());
+            recovered.push(record.clone());
+        }
+    }
+
+    for record in recovered {
+        append_jsonl(&config.results_jsonl, &record)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to append recovered job state to {}",
+                    config.results_jsonl.display()
+                )
+            })?;
+    }
+
+    Ok(jobs)
+}
+
+async fn load_job_records(path: &Path, jobs: &mut HashMap<Uuid, JobRecord>) -> anyhow::Result<()> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<JobRecord>(line).with_context(|| {
+            format!(
+                "failed to parse job record at {}:{}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        jobs.insert(record.id, record);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnqueueError {
+    #[error("job record contains an invalid task specification")]
+    InvalidTask(#[source] crate::types::TaskSpecError),
+    #[error("inference queue is full")]
+    QueueFull,
+    #[error("inference queue is closed")]
+    QueueClosed,
+    #[error(transparent)]
+    Persist(#[from] anyhow::Error),
+}
+
+pub async fn enqueue_record(
+    state: &AppState,
+    record: JobRecord,
+) -> Result<QueueResponse, EnqueueError> {
     let id = record.id;
     let image_path = record.image_path.clone();
     let task = TaskSpec::from_strings(
@@ -34,23 +104,49 @@ pub async fn enqueue_record(state: &AppState, record: JobRecord) -> anyhow::Resu
         Some(record.task_prompt.clone()),
         record.text_input.clone(),
     )
-    .context("job record contains an invalid task specification")?;
+    .map_err(EnqueueError::InvalidTask)?;
+    let request = JobRequest {
+        id,
+        image_path,
+        task,
+    };
+
+    if state.queue_tx.is_full() {
+        return Err(EnqueueError::QueueFull);
+    }
 
     {
         let mut jobs = state.jobs.write().await;
         jobs.insert(id, record.clone());
     }
-    append_jsonl(&state.config.submissions_jsonl, &record).await?;
 
-    state
-        .queue_tx
-        .send(JobRequest {
-            id,
-            image_path,
-            task,
-        })
+    append_jsonl(&state.config.submissions_jsonl, &record)
         .await
-        .context("inference queue is closed")?;
+        .map_err(EnqueueError::Persist)?;
+
+    match state.queue_tx.try_send(request) {
+        Ok(()) => {}
+        Err(async_channel::TrySendError::Full(_)) => {
+            state.jobs.write().await.remove(&id);
+            persist_unqueued_record(
+                &state.config.results_jsonl,
+                record,
+                "inference queue became full before the job could be queued",
+            )
+            .await?;
+            return Err(EnqueueError::QueueFull);
+        }
+        Err(async_channel::TrySendError::Closed(_)) => {
+            state.jobs.write().await.remove(&id);
+            persist_unqueued_record(
+                &state.config.results_jsonl,
+                record,
+                "inference queue closed before the job could be queued",
+            )
+            .await?;
+            return Err(EnqueueError::QueueClosed);
+        }
+    }
 
     info!(
         "job queued job_id={} task_type={} task_prompt={} text_input_present={} input_kind={} image_path={} image_bytes={} sha256={} queued={}",
@@ -72,9 +168,23 @@ pub async fn enqueue_record(state: &AppState, record: JobRecord) -> anyhow::Resu
     })
 }
 
+async fn persist_unqueued_record(
+    results_jsonl: &Path,
+    mut record: JobRecord,
+    error: &str,
+) -> Result<(), EnqueueError> {
+    record.status = JobStatus::Failed;
+    record.updated_at = time::OffsetDateTime::now_utc();
+    record.error = Some(error.to_string());
+    append_jsonl(results_jsonl, &record)
+        .await
+        .map_err(EnqueueError::Persist)
+}
+
 pub fn start_workers(
     config: Arc<Config>,
     jobs: Arc<RwLock<HashMap<Uuid, JobRecord>>>,
+    workers: Arc<WorkerPoolState>,
     queue_rx: Receiver<JobRequest>,
 ) {
     info!("starting model worker pool workers={}", config.workers);
@@ -82,6 +192,7 @@ pub fn start_workers(
         debug!("spawning model worker worker_id={}", worker_id);
         let config = Arc::clone(&config);
         let jobs = Arc::clone(&jobs);
+        let workers = Arc::clone(&workers);
         let queue_rx = queue_rx.clone();
         tokio::spawn(async move {
             let worker = tokio::task::spawn_blocking({
@@ -93,6 +204,7 @@ pub fn start_workers(
             let mut worker = match worker {
                 Ok(Ok(worker)) => worker,
                 Ok(Err(err)) => {
+                    workers.mark_failed();
                     error!(
                         "failed to initialize model worker worker_id={} error={}",
                         worker_id, err
@@ -100,6 +212,7 @@ pub fn start_workers(
                     return;
                 }
                 Err(err) => {
+                    workers.mark_failed();
                     error!(
                         "model worker initialization panicked worker_id={} error={}",
                         worker_id, err
@@ -108,6 +221,7 @@ pub fn start_workers(
                 }
             };
 
+            workers.mark_ready();
             info!("model worker ready worker_id={}", worker_id);
             while let Ok(request) = queue_rx.recv().await {
                 debug!(
@@ -156,6 +270,7 @@ pub fn start_workers(
                     }
                 }
             }
+            workers.mark_stopped();
         });
     }
 }
@@ -267,10 +382,11 @@ fn path_is_inside(path: &Path, directory: &Path) -> bool {
 mod tests {
     use std::net::SocketAddr;
 
+    use async_channel::bounded;
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::config::ModelVariant;
+    use crate::{config::ModelVariant, state::WorkerPoolState};
 
     fn test_config() -> Config {
         Config {
@@ -282,6 +398,8 @@ mod tests {
             metadata_dir: PathBuf::from("data/metadata"),
             submissions_jsonl: PathBuf::from("data/metadata/submissions.jsonl"),
             results_jsonl: PathBuf::from("data/metadata/results.jsonl"),
+            allow_local_paths: false,
+            local_path_roots: Vec::new(),
             workers: 1,
             queue_size: 1,
             body_limit_bytes: 1024,
@@ -314,6 +432,21 @@ mod tests {
         }
     }
 
+    fn temp_config(name: &str) -> Config {
+        let mut config = test_config();
+        let dir = std::env::temp_dir().join(format!(
+            "florence2-base-inference-server-{name}-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+        config.data_dir = dir.clone();
+        config.images_dir = dir.join("images");
+        config.metadata_dir = dir.join("metadata");
+        config.submissions_jsonl = config.metadata_dir.join("submissions.jsonl");
+        config.results_jsonl = config.metadata_dir.join("results.jsonl");
+        config
+    }
+
     #[test]
     fn deletes_only_uploaded_images_under_images_dir() {
         let config = test_config();
@@ -334,5 +467,60 @@ mod tests {
             &config,
             &job_record("upload", PathBuf::from("data/images"))
         ));
+    }
+
+    #[tokio::test]
+    async fn load_jobs_recovers_non_terminal_jobs_as_failed() {
+        let config = temp_config("recover");
+        let mut record = job_record("upload", config.images_dir.join("job.png"));
+        record.status = JobStatus::Running;
+
+        append_jsonl(&config.submissions_jsonl, &record)
+            .await
+            .unwrap();
+
+        let jobs = load_jobs(&config).await.unwrap();
+        let recovered = jobs.get(&record.id).unwrap();
+
+        assert_eq!(recovered.status, JobStatus::Failed);
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some("server restarted before job reached a terminal state")
+        );
+        assert!(
+            std::fs::read_to_string(&config.results_jsonl)
+                .unwrap()
+                .contains("server restarted before job reached a terminal state")
+        );
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_record_rejects_full_queue_without_persisting() {
+        let config = Arc::new(temp_config("queue-full"));
+        let (queue_tx, queue_rx) = bounded(1);
+        queue_tx
+            .try_send(JobRequest {
+                id: Uuid::new_v4(),
+                image_path: PathBuf::from("busy.png"),
+                task: TaskSpec::default(),
+            })
+            .unwrap();
+        let state = AppState {
+            config: Arc::clone(&config),
+            queue_tx,
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            workers: Arc::new(WorkerPoolState::new(1)),
+        };
+        let record = job_record("upload", config.images_dir.join("job.png"));
+        let err = enqueue_record(&state, record.clone()).await.unwrap_err();
+
+        assert!(matches!(err, EnqueueError::QueueFull));
+        assert!(state.jobs.read().await.get(&record.id).is_none());
+        assert!(!config.submissions_jsonl.exists());
+
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        drop(queue_rx);
     }
 }

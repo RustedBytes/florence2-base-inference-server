@@ -20,6 +20,8 @@ Sample config:
 [server]
 bind_addr = "127.0.0.1:3000"
 data_dir = "data"
+allow_local_paths = false
+local_path_roots = []
 
 [model]
 variant = "fp32"
@@ -87,6 +89,8 @@ Environment variables override TOML values when set:
 
 - `BIND_ADDR`: bind address, default `127.0.0.1:3000`
 - `DATA_DIR`: image and JSONL metadata directory, default `data`
+- `ALLOW_LOCAL_PATHS`: set to `true` to enable `/v1/infer/path`
+- `LOCAL_PATH_ROOTS`: platform-separated allowed roots for `/v1/infer/path`
 - `MODEL_POOL_SIZE`: number of model workers
 - `QUEUE_SIZE`: queued job capacity
 - `BODY_LIMIT_BYTES`: multipart upload limit
@@ -96,3 +100,13 @@ Environment variables override TOML values when set:
 - `EXECUTION_PROVIDERS`: comma-separated provider list, for example `auto` or `coreml,auto`
 - `RUST_LOG`: logging level, for example `debug`
 - `CONFIG_PATH`: explicit TOML config path when `--config` is not set
+
+`/v1/infer/path` is disabled by default. To enable it safely:
+
+```toml
+[server]
+allow_local_paths = true
+local_path_roots = ["/srv/florence-inputs"]
+```
+
+Only files under the configured roots are accepted. The server rejects startup configuration where local paths are enabled without at least one root.
