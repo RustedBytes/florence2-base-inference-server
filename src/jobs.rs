@@ -119,6 +119,8 @@ pub fn start_workers(
                     let image_path = request.image_path.clone();
                     let task = request.task.clone();
                     let worker_id = worker_id;
+                    // ORT inference is CPU/GPU-bound and may block. Move the
+                    // worker into a blocking task, then return it to this loop.
                     let mut worker = worker.take_for_blocking();
                     move || {
                         let result = worker.infer(&image_path, &task);

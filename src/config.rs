@@ -114,6 +114,8 @@ struct FileConfig {
 
 impl FileConfig {
     fn load(config_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        // CLI path wins over CONFIG_PATH. Missing default config.toml is OK so
+        // the binary can still run with built-in defaults.
         let has_cli_path = config_path.is_some();
         let has_env_path = env::var_os("CONFIG_PATH").is_some();
         let config_path = config_path
@@ -249,6 +251,8 @@ fn usize_setting(key: &str, file_value: Option<usize>, default: usize) -> anyhow
 }
 
 fn execution_providers_setting(file_value: Option<Vec<String>>) -> Vec<String> {
+    // Keep provider names normalized once here; inference can then match simple
+    // strings without accepting every spelling variant again.
     let values = env::var("EXECUTION_PROVIDERS")
         .ok()
         .map(|value| {

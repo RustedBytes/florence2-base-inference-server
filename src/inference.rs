@@ -34,6 +34,8 @@ pub struct FlorenceWorker {
     id: usize,
     model_paths: FlorenceModelPaths,
     model_variant: ModelVariant,
+    // Florence generation is split across exported ONNX graphs. Keep each
+    // session alive inside one worker so a queue slot owns a full model set.
     vision_encoder: Option<Session>,
     embed_tokens: Option<Session>,
     encoder_model: Option<Session>,
@@ -143,6 +145,9 @@ impl FlorenceWorker {
     }
 
     pub fn take_for_blocking(&mut self) -> Self {
+        // ONNX sessions are consumed by a blocking thread for inference and
+        // returned afterward. Option::take prevents two threads from touching
+        // the same session handle at once.
         Self {
             id: self.id,
             model_paths: self.model_paths.clone(),
@@ -270,6 +275,8 @@ impl FlorenceWorker {
         image_size: (u32, u32),
     ) -> anyhow::Result<Vec<GenerationMetadata>> {
         if task.task_type == "Cascased task" {
+            // Cascaded HF Space tasks first produce a caption, then reuse that
+            // caption as text input for phrase grounding.
             let caption_token = match task.task_prompt.as_str() {
                 "Caption + Grounding" => "<CAPTION>",
                 "Detailed Caption + Grounding" => "<DETAILED_CAPTION>",
@@ -298,6 +305,8 @@ impl FlorenceWorker {
     ) -> anyhow::Result<GenerationMetadata> {
         let prompt_ids = self.encode_prompt(&task.prompt_text)?;
         let text_embeds = self.run_embed_tokens(&prompt_ids)?;
+        // The ONNX encoder expects the image tokens and prompt tokens in one
+        // embedding sequence, matching Florence's processor output.
         let encoder_inputs = concat_embeddings(image_features, &text_embeds)?;
         let encoder_attention_mask = vec![1_i64; encoder_inputs.seq_len()?];
         let encoder_hidden_states =
@@ -305,6 +314,9 @@ impl FlorenceWorker {
 
         let mut generated_ids = vec![DECODER_START_TOKEN_ID];
         for _ in 0..self.max_new_tokens {
+            // decoder_with_past_model in this export requires cache tensors.
+            // Re-running decoder_model over the full generated prefix is slower
+            // but keeps generation simple and robust for all variants.
             let decoder_embeds = self.run_embed_tokens(&generated_ids)?;
             let logits = self.run_decoder_model(
                 decoder_embeds,
@@ -327,6 +339,8 @@ impl FlorenceWorker {
             .decode(&generated_u32, false)
             .map_err(|err| anyhow!("failed to decode generated tokens: {err}"))?;
         let generated_text = clean_generated_text(&raw_text);
+        // Florence embeds structure such as boxes and polygons directly in the
+        // decoded text via special tokens; convert those into JSON here.
         let result = post_process_generation(&task.task_token, &generated_text, image_size);
 
         debug!(
@@ -624,6 +638,8 @@ fn load_session(path: &Path, execution_providers: &[String]) -> anyhow::Result<S
         .all(|provider| provider.as_str() == "cpu");
     let has_requested_eps = !requested_eps.is_empty();
 
+    // Keep explicit EP registration opt-in. CoreML can register on Apple
+    // Silicon but still spend a long time compiling unsupported dynamic graphs.
     let mut builder = Session::builder()
         .map_err(|err| anyhow!("failed to create ONNX session builder: {err}"))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -913,6 +929,8 @@ fn post_process_generation(
         return json!({ task_token: generated_text });
     }
 
+    // OCR-with-region returns text followed by Florence location tokens.
+    // Preserve the raw text and add pixel-space boxes for API consumers.
     let items = parse_ocr_regions(generated_text, image_size);
     if items.is_empty() {
         return json!({ task_token: generated_text });
@@ -936,6 +954,8 @@ fn parse_ocr_regions(generated_text: &str, image_size: (u32, u32)) -> Vec<Value>
         let mut loc_tokens = Vec::new();
         let mut loc_cursor = loc_start;
 
+        // A single OCR item is encoded as text plus a contiguous run of
+        // <loc_N> tokens. Four pairs form the usual quadrilateral.
         while let Some((loc, next_cursor)) = parse_loc_token_at(generated_text, loc_cursor) {
             loc_tokens.push(loc);
             loc_cursor = next_cursor;
@@ -1006,6 +1026,7 @@ fn ocr_region_item(text: String, loc_tokens: Vec<u16>, image_size: (u32, u32)) -
 }
 
 fn scale_loc(value: u16, image_side: u32) -> f64 {
+    // Florence location bins are normalized to 0..999, not image pixels.
     round3((f64::from(value) / 999.0) * f64::from(image_side))
 }
 
