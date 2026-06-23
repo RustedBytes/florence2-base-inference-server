@@ -675,6 +675,7 @@ fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<Executio
                     .with_model_format(ep::coreml::ModelFormat::MLProgram)
                     .build(),
             ),
+            "cuda" => cuda_execution_provider(),
             "xnnpack" => Some(ep::XNNPACK::default().build()),
             "auto" | "autodevice" | "cpu" => None,
             other => {
@@ -683,6 +684,17 @@ fn execution_provider_dispatches(execution_providers: &[String]) -> Vec<Executio
             }
         })
         .collect()
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_execution_provider() -> Option<ExecutionProviderDispatch> {
+    Some(ep::CUDA::default().build())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_execution_provider() -> Option<ExecutionProviderDispatch> {
+    warn!("CUDA execution provider requested but this binary was built without `--features cuda`");
+    None
 }
 
 fn preprocess_image(image: DynamicImage) -> anyhow::Result<Vec<f32>> {
@@ -1091,5 +1103,13 @@ mod tests {
         assert_eq!(item["bbox"]["x_max"], 990.396);
         assert_eq!(item["bbox"]["y_max"], 631.393);
         assert_eq!(item["polygon"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn cuda_provider_is_feature_gated() {
+        let providers = vec!["cuda".to_string()];
+        let dispatches = execution_provider_dispatches(&providers);
+
+        assert_eq!(dispatches.len(), usize::from(cfg!(feature = "cuda")));
     }
 }

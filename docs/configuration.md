@@ -60,8 +60,28 @@ Supported `runtime.execution_providers` values:
 - `coreml_gpu`: CoreML CPU+GPU
 - `coreml_npu`: CoreML CPU+Neural Engine
 - `xnnpack`: XNNPACK when available in the ORT build
+- `cuda`: NVIDIA CUDA, only when built with the Cargo `cuda` feature
 
 `auto` is the default. On Apple Silicon, CoreML may register successfully but still compile only parts of Florence's dynamic ONNX graphs and can emit unbounded-dimension warnings during session load.
+
+Build with CUDA support:
+
+```bash
+cargo run --features cuda
+```
+
+Then request CUDA explicitly:
+
+```toml
+[runtime]
+execution_providers = ["cuda", "cpu"]
+```
+
+or with the environment:
+
+```bash
+EXECUTION_PROVIDERS=cuda,cpu cargo run --features cuda
+```
 
 Environment variables override TOML values when set:
 

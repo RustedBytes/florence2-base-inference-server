@@ -19,6 +19,7 @@ max_new_tokens = 256
 
 [runtime]
 # Supported values: auto, cpu, coreml, coreml_gpu, coreml_npu, xnnpack.
+# CUDA is also supported when the binary is built with `--features cuda`.
 # Keep auto as the default. CoreML can be noisy/slow to compile for Florence's dynamic ONNX graphs.
 execution_providers = ["auto"]
 

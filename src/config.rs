@@ -352,6 +352,17 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_execution_provider_names() {
+        let providers = execution_providers_setting(Some(vec![
+            " CoreML-GPU ".to_string(),
+            "CUDA".to_string(),
+            "xnn_pack".to_string(),
+        ]));
+
+        assert_eq!(providers, vec!["coremlgpu", "cuda", "xnnpack"]);
+    }
+
+    #[test]
     fn model_variant_selects_matching_default_model_path() {
         let cases = [
             (
