@@ -34,6 +34,10 @@ RUN set -eux; \
         -maxdepth 1 \
         \( -type f -o -type l \) \
         \( -name '*.so' -o -name '*.so.*' \) \
+        -exec cp -L '{}' /out/lib/ \;; \
+    find /root/.cache/ort.pyke.io \
+        -type f \
+        \( -name 'libonnxruntime*.so' -o -name 'libonnxruntime*.so.*' \) \
         -exec cp -L '{}' /out/lib/ \;
 
 FROM docker.io/nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04 AS runtime
@@ -51,7 +55,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /out/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
-COPY --from=builder /out/lib/ /usr/local/lib/
+COPY --from=builder /out/lib/ /app/
 COPY config.example.toml /app/config.example.toml
 
 RUN mkdir -p /app/data /app/Florence-2-base \
@@ -60,7 +64,7 @@ RUN mkdir -p /app/data /app/Florence-2-base \
 ENV BIND_ADDR=0.0.0.0:3000 \
     DATA_DIR=/app/data \
     EXECUTION_PROVIDERS=cuda,cpu \
-    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64 \
+    LD_LIBRARY_PATH=/app:/usr/local/cuda/lib64 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_VISIBLE_DEVICES=all \
     RUST_LOG=info,ort=warn
