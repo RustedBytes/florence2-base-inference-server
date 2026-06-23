@@ -24,11 +24,12 @@ pub struct JobRequest {
 pub async fn enqueue_record(state: &AppState, record: JobRecord) -> anyhow::Result<QueueResponse> {
     let id = record.id;
     let image_path = record.image_path.clone();
-    let task = TaskSpec {
-        task_type: record.task_type.clone(),
-        task_prompt: record.task_prompt.clone(),
-        text_input: record.text_input.clone(),
-    };
+    let task = TaskSpec::from_strings(
+        Some(record.task_type.clone()),
+        Some(record.task_prompt.clone()),
+        record.text_input.clone(),
+    )
+    .context("job record contains an invalid task specification")?;
 
     {
         let mut jobs = state.jobs.write().await;
@@ -108,8 +109,8 @@ pub fn start_workers(
                     "worker received job worker_id={} job_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
                     worker_id,
                     request.id,
-                    request.task.task_type,
-                    request.task.task_prompt,
+                    request.task.task_type_name(),
+                    request.task.task_prompt_name(),
                     request.task.text_input.is_some(),
                     request.image_path.display()
                 );

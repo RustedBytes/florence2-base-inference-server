@@ -1,5 +1,7 @@
 use askama::Template;
 
+use crate::types::TaskPrompt;
+
 #[derive(Template)]
 #[template(
     source = r###"
@@ -170,15 +172,15 @@ use askama::Template;
     const singlePrompts = [
       {% for prompt in single_task_prompts %}"{{ prompt }}"{% if !loop.last %},{% endif %}{% endfor %}
     ];
-    const cascasedPrompts = [
-      {% for prompt in cascased_task_prompts %}"{{ prompt }}"{% if !loop.last %},{% endif %}{% endfor %}
+    const cascadedPrompts = [
+      {% for prompt in cascaded_task_prompts %}"{{ prompt }}"{% if !loop.last %},{% endif %}{% endfor %}
     ];
     const taskPrompt = document.getElementById("task_prompt");
     const radios = document.querySelectorAll('input[name="task_type"]');
 
     function updatePrompts() {
       const taskType = document.querySelector('input[name="task_type"]:checked').value;
-      const prompts = taskType === "Cascased task" ? cascasedPrompts : singlePrompts;
+      const prompts = taskType === "Cascased task" ? cascadedPrompts : singlePrompts;
       taskPrompt.replaceChildren(...prompts.map((prompt) => {
         const option = document.createElement("option");
         option.value = prompt;
@@ -195,8 +197,8 @@ use askama::Template;
     ext = "html"
 )]
 pub struct IndexTemplate<'a> {
-    pub single_task_prompts: &'a [&'a str],
-    pub cascased_task_prompts: &'a [&'a str],
+    pub single_task_prompts: &'a [TaskPrompt],
+    pub cascaded_task_prompts: &'a [TaskPrompt],
     pub queued: bool,
     pub job_id: String,
     pub status_url: String,

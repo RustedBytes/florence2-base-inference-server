@@ -22,7 +22,7 @@ use tokenizers::Tokenizer;
 
 use crate::{
     config::{Config, ModelVariant},
-    types::{GenerationMetadata, InferenceMetadata, TaskSpec, TensorMetadata},
+    types::{GenerationMetadata, InferenceMetadata, TaskSpec, TaskType, TensorMetadata},
 };
 
 const IMAGE_SIDE: u32 = 768;
@@ -175,8 +175,8 @@ impl FlorenceWorker {
         info!(
             "inference started worker_id={} task_type={} task_prompt={} text_input_present={} image_path={}",
             self.id,
-            task.task_type,
-            task.task_prompt,
+            task.task_type_name(),
+            task.task_prompt_name(),
             task.text_input.is_some(),
             image_path.display()
         );
@@ -274,15 +274,12 @@ impl FlorenceWorker {
         task: &TaskSpec,
         image_size: (u32, u32),
     ) -> anyhow::Result<Vec<GenerationMetadata>> {
-        if task.task_type == "Cascased task" {
+        if task.task_type == TaskType::Cascaded {
             // Cascaded HF Space tasks first produce a caption, then reuse that
             // caption as text input for phrase grounding.
-            let caption_token = match task.task_prompt.as_str() {
-                "Caption + Grounding" => "<CAPTION>",
-                "Detailed Caption + Grounding" => "<DETAILED_CAPTION>",
-                "More Detailed Caption + Grounding" => "<MORE_DETAILED_CAPTION>",
-                other => return Err(anyhow!("unsupported cascased task prompt `{other}`")),
-            };
+            let caption_token = task.task_prompt.cascaded_caption_token().ok_or_else(|| {
+                anyhow!("unsupported cascaded task prompt `{}`", task.task_prompt)
+            })?;
             let caption = ResolvedTask::new(caption_token, None)?;
             let first = self.generate_once(image_features, &caption, image_size)?;
             let grounding_input = generation_text_for_input(&first);
@@ -582,23 +579,10 @@ struct ResolvedTask {
 
 impl ResolvedTask {
     fn from_task_spec(task: &TaskSpec) -> anyhow::Result<Self> {
-        let task_token = match task.task_prompt.as_str() {
-            "Caption" => "<CAPTION>",
-            "Detailed Caption" => "<DETAILED_CAPTION>",
-            "More Detailed Caption" => "<MORE_DETAILED_CAPTION>",
-            "Object Detection" => "<OD>",
-            "Dense Region Caption" => "<DENSE_REGION_CAPTION>",
-            "Region Proposal" => "<REGION_PROPOSAL>",
-            "Caption to Phrase Grounding" => "<CAPTION_TO_PHRASE_GROUNDING>",
-            "Referring Expression Segmentation" => "<REFERRING_EXPRESSION_SEGMENTATION>",
-            "Region to Segmentation" => "<REGION_TO_SEGMENTATION>",
-            "Open Vocabulary Detection" => "<OPEN_VOCABULARY_DETECTION>",
-            "Region to Category" => "<REGION_TO_CATEGORY>",
-            "Region to Description" => "<REGION_TO_DESCRIPTION>",
-            "OCR" => "<OCR>",
-            "OCR with Region" => "<OCR_WITH_REGION>",
-            other => return Err(anyhow!("unsupported task prompt `{other}`")),
-        };
+        let task_token = task
+            .task_prompt
+            .single_task_token()
+            .ok_or_else(|| anyhow!("unsupported single task prompt `{}`", task.task_prompt))?;
         Self::new(task_token, task.text_input.clone())
     }
 
@@ -961,10 +945,10 @@ fn parse_ocr_regions(generated_text: &str, image_size: (u32, u32)) -> Vec<Value>
             loc_cursor = next_cursor;
         }
 
-        if !loc_tokens.is_empty() {
-            if let Some(item) = ocr_region_item(text, loc_tokens, image_size) {
-                items.push(item);
-            }
+        if !loc_tokens.is_empty()
+            && let Some(item) = ocr_region_item(text, loc_tokens, image_size)
+        {
+            items.push(item);
         }
 
         cursor = loc_cursor;

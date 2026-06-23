@@ -21,35 +21,12 @@ use crate::{
     jobs::enqueue_record,
     state::AppState,
     templates::IndexTemplate,
-    types::{HealthResponse, JobRecord, JobStatus, QueueResponse, TaskSpec},
+    types::{
+        CASCADED_TASK_PROMPTS, HealthResponse, JobRecord, JobStatus, QueueResponse,
+        SINGLE_TASK_PROMPTS, TaskSpec,
+    },
     util::{guess_extension, image_format_content_type, sha256_hex},
 };
-
-const TASK_TYPE_SINGLE: &str = "Single task";
-const TASK_TYPE_CASCASED: &str = "Cascased task";
-
-const SINGLE_TASK_PROMPTS: &[&str] = &[
-    "Caption",
-    "Detailed Caption",
-    "More Detailed Caption",
-    "Object Detection",
-    "Dense Region Caption",
-    "Region Proposal",
-    "Caption to Phrase Grounding",
-    "Referring Expression Segmentation",
-    "Region to Segmentation",
-    "Open Vocabulary Detection",
-    "Region to Category",
-    "Region to Description",
-    "OCR",
-    "OCR with Region",
-];
-
-const CASCASED_TASK_PROMPTS: &[&str] = &[
-    "Caption + Grounding",
-    "Detailed Caption + Grounding",
-    "More Detailed Caption + Grounding",
-];
 
 pub fn router(state: AppState, body_limit_bytes: usize) -> Router {
     Router::new()
@@ -154,7 +131,9 @@ async fn submit_multipart_job(
     debug!("multipart inference submission started");
 
     let mut image: Option<UploadedImage> = None;
-    let mut task = TaskSpec::default();
+    let mut task_type: Option<String> = None;
+    let mut task_prompt: Option<String> = None;
+    let mut text_input: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -183,25 +162,24 @@ async fn submit_multipart_job(
                 });
             }
             "task_type" | "task_type_selector" => {
-                task.task_type = field.text().await.map_err(|err| {
+                task_type = Some(field.text().await.map_err(|err| {
                     ApiError::BadRequest(format!("failed to read task_type field: {err}"))
-                })?;
+                })?);
             }
             "task_prompt" | "task" => {
-                task.task_prompt = field.text().await.map_err(|err| {
+                task_prompt = Some(field.text().await.map_err(|err| {
                     ApiError::BadRequest(format!("failed to read task field: {err}"))
-                })?;
+                })?);
             }
             "text_input" => {
-                let text_input = field.text().await.map_err(|err| {
+                text_input = Some(field.text().await.map_err(|err| {
                     ApiError::BadRequest(format!("failed to read text_input field: {err}"))
-                })?;
-                task.text_input = normalize_optional_text(text_input);
+                })?);
             }
             _ => {}
         }
     }
-    validate_task_spec(&task)?;
+    let task = task_spec_from_request(task_type, task_prompt, text_input, None)?;
 
     let image =
         image.ok_or_else(|| ApiError::BadRequest("multipart field `image` is required".into()))?;
@@ -238,8 +216,8 @@ async fn submit_multipart_job(
         image_bytes: image.bytes.len(),
         input_kind: "upload".to_string(),
         source_path: None,
-        task_type: task.task_type,
-        task_prompt: task.task_prompt,
+        task_type: task.task_type_name().to_string(),
+        task_prompt: task.task_prompt_name().to_string(),
         text_input: task.text_input,
         result: None,
         error: None,
@@ -327,8 +305,8 @@ async fn submit_inference_path(
         image_bytes: bytes.len(),
         input_kind: "local_path".to_string(),
         source_path: Some(image_path),
-        task_type: task.task_type,
-        task_prompt: task.task_prompt,
+        task_type: task.task_type_name().to_string(),
+        task_prompt: task.task_prompt_name().to_string(),
         text_input: task.text_input,
         result: None,
         error: None,
@@ -381,44 +359,8 @@ fn task_spec_from_request(
     text_input: Option<String>,
     task_alias: Option<String>,
 ) -> Result<TaskSpec, ApiError> {
-    let mut task = TaskSpec {
-        task_type: task_type.unwrap_or_else(|| TaskSpec::default().task_type),
-        task_prompt: task_prompt
-            .or(task_alias)
-            .unwrap_or_else(|| TaskSpec::default().task_prompt),
-        text_input: text_input.and_then(normalize_optional_text),
-    };
-
-    task.task_type = task.task_type.trim().to_string();
-    task.task_prompt = task.task_prompt.trim().to_string();
-    validate_task_spec(&task)?;
-    Ok(task)
-}
-
-fn validate_task_spec(task: &TaskSpec) -> Result<(), ApiError> {
-    let allowed_prompts = match task.task_type.as_str() {
-        TASK_TYPE_SINGLE => SINGLE_TASK_PROMPTS,
-        TASK_TYPE_CASCASED => CASCASED_TASK_PROMPTS,
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "unsupported task_type `{other}`; expected `{TASK_TYPE_SINGLE}` or `{TASK_TYPE_CASCASED}`"
-            )));
-        }
-    };
-
-    if !allowed_prompts.contains(&task.task_prompt.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "unsupported task_prompt `{}` for task_type `{}`",
-            task.task_prompt, task.task_type
-        )));
-    }
-
-    Ok(())
-}
-
-fn normalize_optional_text(text: String) -> Option<String> {
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+    TaskSpec::from_strings(task_type, task_prompt.or(task_alias), text_input)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))
 }
 
 fn render_index(
@@ -427,7 +369,7 @@ fn render_index(
 ) -> Result<Html<String>, ApiError> {
     let template = IndexTemplate {
         single_task_prompts: SINGLE_TASK_PROMPTS,
-        cascased_task_prompts: CASCASED_TASK_PROMPTS,
+        cascaded_task_prompts: CASCADED_TASK_PROMPTS,
         queued: response.is_some(),
         job_id: response
             .as_ref()

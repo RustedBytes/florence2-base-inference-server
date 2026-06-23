@@ -55,7 +55,7 @@ curl http://127.0.0.1:3000/v1/jobs/<job-id>
 
 Requests use the same task fields as the Florence-2 Space:
 
-- `task_type`: `Single task` or `Cascased task`
+- `task_type`: `Single task` or `Cascased task` (`Cascaded task` is also accepted)
 - `task_prompt`: defaults to `Caption`
 - `text_input`: optional text for prompts that need it
 
