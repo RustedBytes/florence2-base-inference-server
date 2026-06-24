@@ -26,3 +26,28 @@ fn cuda_provider_is_feature_gated() {
 
     assert_eq!(dispatches.len(), usize::from(cfg!(feature = "cuda")));
 }
+
+#[test]
+fn runtime_backend_summary_keeps_provider_order_visible() {
+    let providers = vec!["cuda".to_string(), "cpu".to_string()];
+    let devices = vec!["CPUExecutionProvider:CPU".to_string()];
+
+    let summary = runtime_backend_summary(&providers, &devices);
+
+    assert_eq!(
+        summary,
+        "ort:execution_providers=cuda,cpu;detected_devices=CPUExecutionProvider:CPU"
+    );
+}
+
+#[test]
+fn runtime_backend_summary_handles_missing_devices() {
+    let providers = vec!["auto".to_string()];
+
+    let summary = runtime_backend_summary(&providers, &[]);
+
+    assert_eq!(
+        summary,
+        "ort:execution_providers=auto;detected_devices=none_reported"
+    );
+}

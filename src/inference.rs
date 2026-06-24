@@ -112,13 +112,14 @@ impl FlorenceWorker {
             .collect::<Vec<_>>();
 
         if devices.is_empty() {
-            warn!("ONNX Runtime did not report accelerator devices; CPU fallback will be used");
+            warn!("ONNX Runtime did not report hardware devices");
         } else {
             info!(
-                "ONNX Runtime detected devices worker_id={} devices={:?}",
+                "ONNX Runtime detected hardware devices worker_id={} devices={:?}",
                 id, devices
             );
         }
+        let backend = runtime_backend_summary(&config.execution_providers, &devices);
 
         let session_started = Instant::now();
         let vision_encoder =
@@ -161,7 +162,7 @@ impl FlorenceWorker {
                 decoder_model_merged: Some(decoder_model_merged),
             },
             tokenizer,
-            backend: format!("ort:auto:max_performance:{}", devices.join(",")),
+            backend,
             image_input: ImageInput {
                 input_name,
                 input_dtype,
@@ -171,11 +172,10 @@ impl FlorenceWorker {
         };
 
         info!(
-            "model worker initialized worker_id={} backend={} max_new_tokens={} execution_providers={:?} elapsed_ms={}",
+            "model worker initialized worker_id={} backend={} max_new_tokens={} elapsed_ms={}",
             id,
             worker.backend,
             worker.max_new_tokens,
-            worker.execution_providers,
             started.elapsed().as_millis()
         );
 
@@ -748,6 +748,21 @@ fn take_output_value(
         .remove(name)
         .map(Arc::new)
         .ok_or_else(|| anyhow!("ONNX output `{name}` is missing"))
+}
+
+fn runtime_backend_summary(execution_providers: &[String], devices: &[String]) -> String {
+    let providers = if execution_providers.is_empty() {
+        "default".to_string()
+    } else {
+        execution_providers.join(",")
+    };
+    let devices = if devices.is_empty() {
+        "none_reported".to_string()
+    } else {
+        devices.join(",")
+    };
+
+    format!("ort:execution_providers={providers};detected_devices={devices}")
 }
 
 #[derive(Debug, Clone)]
