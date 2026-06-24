@@ -10,8 +10,8 @@ use image::{DynamicImage, GenericImageView, ImageReader, imageops::FilterType};
 use log::{debug, info, trace, warn};
 use ort::{
     environment::Environment,
-    session::Session,
-    value::{Shape, Tensor, TensorElementType},
+    session::{Session, SessionInputValue, SessionOutputs},
+    value::{DynValue, Shape, Tensor, TensorElementType},
 };
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -32,6 +32,7 @@ use self::{
 
 const IMAGE_SIDE: u32 = 768;
 const HIDDEN_SIZE: i64 = 768;
+const DECODER_LAYERS: usize = 6;
 const DECODER_START_TOKEN_ID: i64 = 2;
 const EOS_TOKEN_ID: i64 = 2;
 
@@ -58,12 +59,28 @@ struct FlorenceSessions {
     embed_tokens: Option<Session>,
     encoder_model: Option<Session>,
     decoder_model: Option<Session>,
-    decoder_with_past_model: Option<Session>,
+    decoder_model_merged: Option<Session>,
 }
 
 struct ImageInput {
     input_name: String,
     input_dtype: TensorElementType,
+}
+
+struct DecoderRun {
+    logits: TensorData,
+    cache: DecoderCache,
+}
+
+struct DecoderCache {
+    layers: Vec<DecoderLayerCache>,
+}
+
+struct DecoderLayerCache {
+    decoder_key: Arc<DynValue>,
+    decoder_value: Arc<DynValue>,
+    encoder_key: Arc<DynValue>,
+    encoder_value: Arc<DynValue>,
 }
 
 impl FlorenceWorker {
@@ -74,13 +91,13 @@ impl FlorenceWorker {
         model_paths.ensure_exists()?;
 
         info!(
-            "initializing model worker worker_id={} vision_encoder={} embed_tokens={} encoder_model={} decoder_model={} decoder_with_past_model={}",
+            "initializing model worker worker_id={} vision_encoder={} embed_tokens={} encoder_model={} decoder_model={} decoder_model_merged={}",
             id,
             model_paths.vision_encoder.display(),
             model_paths.embed_tokens.display(),
             model_paths.encoder_model.display(),
             model_paths.decoder_model.display(),
-            model_paths.decoder_with_past_model.display()
+            model_paths.decoder_model_merged.display()
         );
 
         let env =
@@ -109,8 +126,8 @@ impl FlorenceWorker {
         let embed_tokens = load_session(&model_paths.embed_tokens, &config.execution_providers)?;
         let encoder_model = load_session(&model_paths.encoder_model, &config.execution_providers)?;
         let decoder_model = load_session(&model_paths.decoder_model, &config.execution_providers)?;
-        let decoder_with_past_model = load_session(
-            &model_paths.decoder_with_past_model,
+        let decoder_model_merged = load_session(
+            &model_paths.decoder_model_merged,
             &config.execution_providers,
         )?;
         let (input_name, input_dtype) = image_input_metadata(&vision_encoder)?;
@@ -141,7 +158,7 @@ impl FlorenceWorker {
                 embed_tokens: Some(embed_tokens),
                 encoder_model: Some(encoder_model),
                 decoder_model: Some(decoder_model),
-                decoder_with_past_model: Some(decoder_with_past_model),
+                decoder_model_merged: Some(decoder_model_merged),
             },
             tokenizer,
             backend: format!("ort:auto:max_performance:{}", devices.join(",")),
@@ -178,7 +195,7 @@ impl FlorenceWorker {
                 embed_tokens: self.sessions.embed_tokens.take(),
                 encoder_model: self.sessions.encoder_model.take(),
                 decoder_model: self.sessions.decoder_model.take(),
-                decoder_with_past_model: self.sessions.decoder_with_past_model.take(),
+                decoder_model_merged: self.sessions.decoder_model_merged.take(),
             },
             tokenizer: self.tokenizer.clone(),
             backend: self.backend.clone(),
@@ -335,17 +352,30 @@ impl FlorenceWorker {
             self.run_encoder_model(encoder_inputs, encoder_attention_mask.clone())?;
 
         let mut generated_ids = vec![DECODER_START_TOKEN_ID];
+        let mut decoder_cache = None;
         for _ in 0..self.max_new_tokens {
-            // decoder_with_past_model in this export requires cache tensors.
-            // Re-running decoder_model over the full generated prefix is slower
-            // but keeps generation simple and robust for all variants.
-            let decoder_embeds = self.run_embed_tokens(&generated_ids)?;
-            let logits = self.run_decoder_model(
-                decoder_embeds,
-                &encoder_hidden_states,
-                &encoder_attention_mask,
-            )?;
-            let next_token_id = argmax_last_token(&logits)?;
+            let decoder_run = if let Some(cache) = decoder_cache.as_ref() {
+                let last_token_id = generated_ids
+                    .last()
+                    .copied()
+                    .ok_or_else(|| anyhow!("decoder token sequence is empty"))?;
+                let decoder_embeds = self.run_embed_tokens(&[last_token_id])?;
+                self.run_cached_decoder_model(
+                    decoder_embeds,
+                    &encoder_hidden_states,
+                    &encoder_attention_mask,
+                    cache,
+                )?
+            } else {
+                let decoder_embeds = self.run_embed_tokens(&generated_ids)?;
+                self.run_decoder_model(
+                    decoder_embeds,
+                    &encoder_hidden_states,
+                    &encoder_attention_mask,
+                )?
+            };
+            let next_token_id = argmax_last_token(&decoder_run.logits)?;
+            decoder_cache = Some(decoder_run.cache);
             generated_ids.push(next_token_id);
             if next_token_id == EOS_TOKEN_ID {
                 break;
@@ -509,7 +539,7 @@ impl FlorenceWorker {
         inputs_embeds: TensorData,
         encoder_hidden_states: &TensorData,
         encoder_attention_mask: &[i64],
-    ) -> anyhow::Result<TensorData> {
+    ) -> anyhow::Result<DecoderRun> {
         let session =
             self.sessions.decoder_model.as_mut().ok_or_else(|| {
                 anyhow!("worker {} decoder_model session is unavailable", self.id)
@@ -532,15 +562,192 @@ impl FlorenceWorker {
         ))
         .map_err(|err| anyhow!("failed to create decoder encoder_attention_mask tensor: {err}"))?;
 
-        let outputs = session
+        let mut outputs = session
             .run(ort::inputs![
                 "inputs_embeds" => inputs_embeds,
                 "encoder_hidden_states" => encoder_hidden_states,
                 "encoder_attention_mask" => encoder_attention_mask,
             ])
             .map_err(|err| anyhow!("decoder_model ONNX inference failed: {err}"))?;
-        extract_output_tensor(&outputs[0], "logits")
+        let logits = extract_named_output_tensor(&outputs, "logits")?;
+        let cache = DecoderCache::from_decoder_outputs(&mut outputs)?;
+        Ok(DecoderRun { logits, cache })
     }
+
+    fn run_cached_decoder_model(
+        &mut self,
+        inputs_embeds: TensorData,
+        encoder_hidden_states: &TensorData,
+        encoder_attention_mask: &[i64],
+        cache: &DecoderCache,
+    ) -> anyhow::Result<DecoderRun> {
+        let session = self.sessions.decoder_model_merged.as_mut().ok_or_else(|| {
+            anyhow!(
+                "worker {} decoder_model_merged session is unavailable",
+                self.id
+            )
+        })?;
+        let decoder_seq_len = inputs_embeds.seq_len()?;
+        let encoder_seq_len = encoder_hidden_states.seq_len()?;
+        let inputs_embeds = Tensor::<f32>::from_array((
+            Shape::from([1, decoder_seq_len as i64, HIDDEN_SIZE]),
+            inputs_embeds.data,
+        ))
+        .map_err(|err| anyhow!("failed to create cached decoder inputs_embeds tensor: {err}"))?;
+        let encoder_hidden_states = Tensor::<f32>::from_array((
+            Shape::from([1, encoder_seq_len as i64, HIDDEN_SIZE]),
+            encoder_hidden_states.data.clone(),
+        ))
+        .map_err(|err| {
+            anyhow!("failed to create cached decoder encoder_hidden_states tensor: {err}")
+        })?;
+        let encoder_attention_mask = Tensor::<i64>::from_array((
+            Shape::from([1, encoder_seq_len as i64]),
+            encoder_attention_mask.to_vec(),
+        ))
+        .map_err(|err| {
+            anyhow!("failed to create cached decoder encoder_attention_mask tensor: {err}")
+        })?;
+        let use_cache_branch = Tensor::<bool>::from_array((Shape::from([1_i64]), vec![true]))
+            .map_err(|err| {
+                anyhow!("failed to create cached decoder branch selector tensor: {err}")
+            })?;
+
+        let mut inputs: Vec<(String, SessionInputValue<'_>)> =
+            Vec::with_capacity(4 + DECODER_LAYERS * 4);
+        inputs.push(("inputs_embeds".to_string(), inputs_embeds.into()));
+        inputs.push((
+            "encoder_hidden_states".to_string(),
+            encoder_hidden_states.into(),
+        ));
+        inputs.push((
+            "encoder_attention_mask".to_string(),
+            encoder_attention_mask.into(),
+        ));
+        inputs.push(("use_cache_branch".to_string(), use_cache_branch.into()));
+
+        for (layer_index, layer) in cache.layers.iter().enumerate() {
+            inputs.push((
+                past_cache_name(layer_index, CacheKind::DecoderKey),
+                layer.decoder_key.as_ref().into(),
+            ));
+            inputs.push((
+                past_cache_name(layer_index, CacheKind::DecoderValue),
+                layer.decoder_value.as_ref().into(),
+            ));
+            inputs.push((
+                past_cache_name(layer_index, CacheKind::EncoderKey),
+                layer.encoder_key.as_ref().into(),
+            ));
+            inputs.push((
+                past_cache_name(layer_index, CacheKind::EncoderValue),
+                layer.encoder_value.as_ref().into(),
+            ));
+        }
+
+        let mut outputs = session
+            .run(inputs)
+            .map_err(|err| anyhow!("decoder_model_merged cached ONNX inference failed: {err}"))?;
+        let logits = extract_named_output_tensor(&outputs, "logits")?;
+        let cache = cache.with_updated_decoder_outputs(&mut outputs)?;
+        Ok(DecoderRun { logits, cache })
+    }
+}
+
+impl DecoderCache {
+    fn from_decoder_outputs(outputs: &mut SessionOutputs<'_>) -> anyhow::Result<Self> {
+        let mut layers = Vec::with_capacity(DECODER_LAYERS);
+        for layer_index in 0..DECODER_LAYERS {
+            layers.push(DecoderLayerCache {
+                decoder_key: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::DecoderKey),
+                )?,
+                decoder_value: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::DecoderValue),
+                )?,
+                encoder_key: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::EncoderKey),
+                )?,
+                encoder_value: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::EncoderValue),
+                )?,
+            });
+        }
+        Ok(Self { layers })
+    }
+
+    fn with_updated_decoder_outputs(
+        &self,
+        outputs: &mut SessionOutputs<'_>,
+    ) -> anyhow::Result<Self> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (layer_index, previous) in self.layers.iter().enumerate() {
+            layers.push(DecoderLayerCache {
+                decoder_key: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::DecoderKey),
+                )?,
+                decoder_value: take_output_value(
+                    outputs,
+                    &present_cache_name(layer_index, CacheKind::DecoderValue),
+                )?,
+                encoder_key: Arc::clone(&previous.encoder_key),
+                encoder_value: Arc::clone(&previous.encoder_value),
+            });
+        }
+        Ok(Self { layers })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CacheKind {
+    DecoderKey,
+    DecoderValue,
+    EncoderKey,
+    EncoderValue,
+}
+
+fn present_cache_name(layer_index: usize, kind: CacheKind) -> String {
+    let suffix = cache_name_suffix(kind);
+    format!("present.{layer_index}.{suffix}")
+}
+
+fn past_cache_name(layer_index: usize, kind: CacheKind) -> String {
+    let suffix = cache_name_suffix(kind);
+    format!("past_key_values.{layer_index}.{suffix}")
+}
+
+fn cache_name_suffix(kind: CacheKind) -> &'static str {
+    match kind {
+        CacheKind::DecoderKey => "decoder.key",
+        CacheKind::DecoderValue => "decoder.value",
+        CacheKind::EncoderKey => "encoder.key",
+        CacheKind::EncoderValue => "encoder.value",
+    }
+}
+
+fn extract_named_output_tensor(
+    outputs: &SessionOutputs<'_>,
+    name: &str,
+) -> anyhow::Result<TensorData> {
+    let value = outputs
+        .get(name)
+        .ok_or_else(|| anyhow!("ONNX output `{name}` is missing"))?;
+    extract_output_tensor(value, name)
+}
+
+fn take_output_value(
+    outputs: &mut SessionOutputs<'_>,
+    name: &str,
+) -> anyhow::Result<Arc<DynValue>> {
+    outputs
+        .remove(name)
+        .map(Arc::new)
+        .ok_or_else(|| anyhow!("ONNX output `{name}` is missing"))
 }
 
 #[derive(Debug, Clone)]

@@ -20,7 +20,7 @@ pub(super) struct FlorenceModelPaths {
     pub(super) embed_tokens: PathBuf,
     pub(super) encoder_model: PathBuf,
     pub(super) decoder_model: PathBuf,
-    pub(super) decoder_with_past_model: PathBuf,
+    pub(super) decoder_model_merged: PathBuf,
 }
 
 impl FlorenceModelPaths {
@@ -41,7 +41,7 @@ impl FlorenceModelPaths {
             embed_tokens: onnx_dir.join(format!("embed_tokens{suffix}.onnx")),
             encoder_model: onnx_dir.join(format!("encoder_model{suffix}.onnx")),
             decoder_model: onnx_dir.join(format!("decoder_model{suffix}.onnx")),
-            decoder_with_past_model: onnx_dir.join(format!("decoder_with_past_model{suffix}.onnx")),
+            decoder_model_merged: onnx_dir.join(format!("decoder_model_merged{suffix}.onnx")),
         }
     }
 
@@ -51,7 +51,7 @@ impl FlorenceModelPaths {
             &self.embed_tokens,
             &self.encoder_model,
             &self.decoder_model,
-            &self.decoder_with_past_model,
+            &self.decoder_model_merged,
         ] {
             if !path.exists() {
                 return Err(anyhow!("model file does not exist: {}", path.display()));
